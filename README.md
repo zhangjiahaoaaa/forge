@@ -1,72 +1,121 @@
 # forge
 
-Small local coding agent for real repositories.
+Local coding agent for real repositories.
 
-Forge runs inside your repo, reads code, executes tools, edits files, keeps local session evidence, and carries forward useful project memory across sessions.
+Forge is a small but structured coding agent that runs inside a local repo, uses tools instead of guessing, keeps local session evidence, and carries forward useful project memory across sessions.
 
-![Forge TUI](assets/screenshots/forge-tui-latest.png)
+![Forge main UI](assets/screenshots/forge-main.png)
 
-## What Forge is
+## Why Forge
 
-Forge is a local coding agent with a real runtime, not just a single prompt loop.
+Most coding agents look impressive in a demo and become hard to trust in real work. Forge is built around a different goal: make local code work inspectable, resumable, and grounded in the repository itself.
 
-It is built around a few practical ideas:
+That means:
 
-- The agent should run against an actual repository, not an abstract chat.
-- Tool use should be observable, reviewable, and bounded by policy.
-- Context should be assembled deliberately from workspace facts, memory, skills, and recent history.
-- Sessions should leave behind evidence you can inspect later.
-- Long-term knowledge should be stored as local files, not hidden in a giant chat transcript.
+- tool calls are explicit
+- risky actions can be gated by approval and sandbox rules
+- prompts are assembled from real workspace context instead of pure chat history
+- every run leaves behind evidence you can inspect later
+- memory is stored as local files, not hidden in an opaque conversation
 
-## What Forge can do
+## What it does
 
-- Read and search code in a local repository
-- Run shell commands with approval and optional sandboxing
-- Write files and patch existing files
-- Work in TUI, REPL, or one-shot CLI mode
-- Maintain working memory and durable project memory
-- Persist session history, event streams, run traces, task state, and reports
-- Support plan mode, todo tracking, worker agents, and reusable skills
-- Load OpenAI-compatible and Anthropic-compatible providers, including DeepSeek profiles
+- Reads, searches, and edits code in a local repository
+- Runs shell commands with approval-aware execution
+- Supports TUI, REPL, and one-shot task execution
+- Persists session history, event streams, traces, reports, and task state
+- Supports plan mode, todo tracking, worker agents, and skills
+- Maintains working memory and durable project memory
+- Works with OpenAI-compatible and Anthropic-compatible providers, including DeepSeek-style profiles
 
-## Why the name Forge
+## What makes Forge different
 
-Forge is meant to feel like a workshop for local code work:
+Forge is not just a loop of `prompt -> tool -> prompt`.
 
-- the model is the planner
-- the tools are the hands
-- the repository is the material
-- the runtime is the discipline that keeps the work coherent
+It has a small runtime architecture around the model:
 
-The goal is not just to generate text, but to shape changes safely inside a real codebase.
+- `runtime`: owns session state, memory, evidence, workspace state, and tool registry
+- `engine`: runs the turn loop that coordinates model calls, tool execution, retries, and final answers
+- `tool runtime`: validates tool calls, enforces policy, and records results
+- `context assembly`: builds prompts from rules, workspace facts, memory, and recent history
+- `evidence plane`: writes session events, run traces, reports, and checkpoints under `.forge/`
+- `memory system`: separates working memory, daily logs, durable topics, and memory index files
+
+This is the main idea behind Forge: the model is only one part of the system. The runtime around it matters just as much.
+
+## How it works
+
+At a high level, one request goes through this path:
+
+1. Forge inspects the workspace and assembles prompt context.
+2. The model chooses either a tool call or a final answer.
+3. Tool calls are validated and executed through the runtime.
+4. Results are written to history and evidence files.
+5. Useful facts are promoted into working memory or durable memory.
+6. The next turn continues from structured state instead of starting from scratch.
+
+That makes Forge better suited for longer coding tasks than a stateless chat loop.
+
+## Core ideas
+
+### 1. Tools are part of the contract
+
+Forge expects the model to act through explicit tools for:
+
+- file reads
+- search
+- shell commands
+- writing and patching files
+- plan mode actions
+- todo updates
+- worker agents
+- user interaction
+
+This keeps execution inspectable and gives the runtime a place to enforce rules.
+
+### 2. Memory is local and file-based
+
+Forge uses layered memory instead of replaying a giant transcript forever:
+
+- working memory for the current session
+- daily logs for append-only observations
+- durable topic files for long-lived project knowledge
+- `MEMORY.md` as a compact memory index
+
+It can also run background `auto-dream` consolidation to turn scattered notes into reusable project memory.
+
+### 3. Evidence is first-class
+
+Each session and run leaves behind structured files such as:
+
+- `.forge/sessions/<id>.json`
+- `.forge/sessions/<id>.events.jsonl`
+- `.forge/runs/<run_id>/trace.jsonl`
+- `.forge/runs/<run_id>/report.json`
+
+This makes it easier to debug agent behavior, understand failures, and resume work later.
+
+### 4. The runtime can evolve
+
+Forge v3 moved beyond a minimal agent loop and introduced a more explicit runtime shape: event bus, evidence pipeline, plan mode, worker management, memory consolidation, and lifecycle hooks.
+
+That makes it a better base for experimenting with coding-agent infrastructure rather than just prompt engineering.
 
 ## Interface
 
-Forge ships with a Textual TUI and a plain terminal REPL on top of the same runtime.
+Forge can run in several ways on top of the same core runtime:
 
-| TUI intro | Tools and actions |
-| --- | --- |
-| ![Forge intro](assets/screenshots/forge-tui-intro.png) | ![Forge tools](assets/screenshots/forge-tui-tools.png) |
-
-| Skills and help | Memory and workspace context |
-| --- | --- |
-| ![Forge skills](assets/screenshots/forge-tui-skills-help.png) | ![Forge memory](assets/screenshots/forge-tui-memory-skills.png) |
-
-## Core runtime pieces
-
-- `provider profile`: chooses model, endpoint, protocol, and auth
-- `context assembly`: builds prompts from system rules, workspace facts, memory, skills, and history
-- `tool runtime`: validates and executes file tools, shell, plan tools, workers, and user prompts
-- `approval and sandbox`: gates risky actions before they run
-- `session and run evidence`: records events, traces, reports, and task state under `.forge/`
-- `memory and auto-dream`: turns local observations into reusable project memory
+- Textual TUI
+- terminal REPL
+- one-shot CLI execution
+- resumed sessions from local state
 
 ## Install
 
 Requirements:
 
 - Python 3.10+
-- At least one working model provider
+- a working model provider
 
 Install from source:
 
@@ -76,7 +125,13 @@ cd forge
 pip install -e .
 ```
 
-You can also run it directly in a development checkout:
+Run it:
+
+```bash
+forge
+```
+
+You can also run it directly from the checkout:
 
 ```bash
 python -m forge
@@ -84,13 +139,13 @@ python -m forge
 
 ## Quick start
 
-Copy the example config:
+Copy the example project config:
 
 ```bash
 cp .forge.toml.example .forge.toml
 ```
 
-Then fill in a provider profile, for example:
+Example provider profile:
 
 ```toml
 provider = "deepseek"
@@ -102,13 +157,7 @@ base_url = "https://api.deepseek.com/anthropic"
 model = "deepseek-v4-pro"
 ```
 
-Start Forge:
-
-```bash
-forge
-```
-
-Common entrypoints:
+Useful entrypoints:
 
 ```bash
 forge
@@ -122,7 +171,7 @@ forge --sandbox best_effort
 
 ## Configuration
 
-Forge resolves configuration in this order:
+Forge resolves config in this order:
 
 ```text
 CLI args > environment variables > project .forge.toml > global config > built-in defaults
@@ -132,7 +181,7 @@ Supported provider styles:
 
 - OpenAI-compatible
 - Anthropic-compatible
-- DeepSeek via profile configuration
+- DeepSeek-style profiles
 
 Useful environment variables:
 
@@ -149,9 +198,9 @@ More detail:
 - [Configuration](docs/configuration.md)
 - [Sandbox](docs/sandbox.md)
 
-## Daily workflow
+## Typical workflow
 
-Inside TUI or REPL, you can use natural language or slash commands:
+Inside Forge you can mix natural language with slash commands:
 
 ```text
 /help
@@ -167,39 +216,7 @@ Inside TUI or REPL, you can use natural language or slash commands:
 /compact
 ```
 
-## Memory model
-
-Forge uses layered local memory instead of replaying an entire transcript forever.
-
-- working memory for the current session
-- daily logs for append-only observations
-- durable topic files for long-lived project knowledge
-- `MEMORY.md` as a compact index
-
-It can also run auto-dream consolidation in the background to turn scattered notes into durable memory files.
-
-More detail:
-
-- [Memory](docs/memory.md)
-
-## Skills
-
-Skills are reusable markdown-based workflows that run through the same runtime and tool system.
-
-Built-in patterns include things like:
-
-- review
-- test
-- commit
-- simplify
-
-You can also add your own project or user skills through `SKILL.md` files.
-
-More detail:
-
-- [Skills](docs/skills.md)
-
-## Project layout
+## Project structure
 
 ```text
 forge/
@@ -216,42 +233,21 @@ forge/
 `-- release/
 ```
 
-Key directories:
+Important directories:
 
-- `forge/core/`: runtime, engine, evidence, workers, context, permissions
-- `forge/providers/`: provider adapters
+- `forge/core/`: runtime, engine, session state, evidence, workers, context
+- `forge/providers/`: model provider adapters
 - `forge/tools/`: tool registry and tool implementations
 - `forge/features/`: memory, skills, sandboxing
 - `forge/tui/`: Textual UI
-- `tests/`: runtime and acceptance tests
-- `release/v3/`: changelog, review pack, learning notes, testing material
-
-## Local state
-
-Forge keeps runtime state in local workspace files such as:
-
-- `.forge/sessions/<id>.json`
-- `.forge/sessions/<id>.events.jsonl`
-- `.forge/runs/<run_id>/`
-- `.forge/memory/`
-
-This is intentional: sessions, traces, and memory stay inspectable and local.
+- `tests/`: runtime and acceptance coverage
 
 ## Testing
-
-Install dev dependencies and run tests:
 
 ```bash
 pip install -e ".[dev]"
 pytest tests/ -q
 ```
-
-There is also a release pack under [`release/v3`](release/v3/README.md) with:
-
-- changelog
-- review notes
-- testing summaries
-- architecture learning material
 
 ## Docs
 
@@ -259,14 +255,11 @@ There is also a release pack under [`release/v3`](release/v3/README.md) with:
 - [Memory](docs/memory.md)
 - [Skills](docs/skills.md)
 - [Sandbox](docs/sandbox.md)
-- [v3 Release Pack](release/v3/README.md)
 - [v3 Changelog](release/v3/CHANGELOG.md)
 
 ## Status
 
-This repository is the renamed Forge version of the local coding agent runtime you have been evolving from the earlier Pico codebase.
-
-The branding, TUI surface, state directory, and documentation are being aligned around `forge`, while the core runtime keeps the same practical focus: local coding, observable tool use, memory, and evidence.
+Forge is the renamed and evolving version of the earlier Pico local coding agent codebase. The branding and documentation are being aligned around `forge`, while the core direction stays the same: local coding, explicit tool use, memory, and evidence.
 
 ## License
 
