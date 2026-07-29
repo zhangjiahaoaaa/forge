@@ -1,0 +1,38 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "forge"
+version = "0.3.0"
+description = "Small local coding agent for OpenAI-compatible, Anthropic-compatible, and DeepSeek models"
+requires-python = ">=3.10"
+dependencies = [
+  "textual>=0.86.0",
+  "tomli>=2.0.0; python_version < '3.11'",
+  "tzdata>=2024.1",
+]
+
+[project.scripts]
+forge = "forge.cli:main"
+forge-tui = "forge.tui.main:main"
+
+[dependency-groups]
+dev = [
+  "pytest>=8.3.5",
+  "pytest-asyncio>=0.23.0",
+  "ruff>=0.4.4",
+]
+
+[tool.setuptools.packages.find]
+include = ["forge*"]
+
+[tool.pytest.ini_options]
+norecursedirs = [
+  ".git",
+  ".venv",
+  "artifacts",
+  "build",
+  "dist",
+  "tests/fixtures",
+]

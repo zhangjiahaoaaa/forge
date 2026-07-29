@@ -1,0 +1,240 @@
+{
+  "schema_version": 1,
+  "description": "Fixed harness regression tasks for Pico benchmark v2. Each run must use a fresh fixture copy and deterministic scripted outputs.",
+  "tasks": [
+    {
+      "id": "readme_intro_locked",
+      "prompt": "In the README fixture, replace the placeholder opening sentence with 'This fixture is a locked benchmark workspace.'",
+      "fixture_repo": "tests/fixtures/bench_repo_readme",
+      "allowed_tools": ["read_file", "patch_file"],
+      "step_budget": 4,
+      "expected_artifact": "README.md opening sentence is locked benchmark workspace text",
+      "verifier": "python3 -c \"from pathlib import Path; text = Path('README.md').read_text(encoding='utf-8'); assert 'This fixture is a locked benchmark workspace.' in text\"",
+      "category": "documentation"
+    },
+    {
+      "id": "readme_schema_note",
+      "prompt": "Replace the first README bullet with a sentence that says the benchmark schema and baseline are fixed.",
+      "fixture_repo": "tests/fixtures/bench_repo_readme",
+      "allowed_tools": ["read_file", "patch_file"],
+      "step_budget": 4,
+      "expected_artifact": "README.md contains the schema and baseline note",
+      "verifier": "python3 -c \"from pathlib import Path; text = Path('README.md').read_text(encoding='utf-8'); assert 'schema and baseline are fixed' in text\"",
+      "category": "documentation"
+    },
+    {
+      "id": "sample_beta_locked",
+      "prompt": "In sample.txt, replace beta with beta-locked.",
+      "fixture_repo": "tests/fixtures/bench_repo_patch",
+      "allowed_tools": ["read_file", "patch_file"],
+      "step_budget": 4,
+      "expected_artifact": "sample.txt contains beta-locked",
+      "verifier": "python3 -c \"from pathlib import Path; text = Path('sample.txt').read_text(encoding='utf-8'); assert 'beta-locked' in text and '\\nbeta\\n' not in text\"",
+      "category": "text-edit"
+    },
+    {
+      "id": "sample_gamma_locked",
+      "prompt": "In sample.txt, replace gamma with gamma-locked.",
+      "fixture_repo": "tests/fixtures/bench_repo_patch",
+      "allowed_tools": ["read_file", "patch_file"],
+      "step_budget": 4,
+      "expected_artifact": "sample.txt contains gamma-locked",
+      "verifier": "python3 -c \"from pathlib import Path; text = Path('sample.txt').read_text(encoding='utf-8'); assert 'gamma-locked' in text\"",
+      "category": "text-edit"
+    },
+    {
+      "id": "invalid_patch_recovery",
+      "prompt": "Recover after invalid patch arguments and finish the README patch.",
+      "fixture_repo": "tests/fixtures/bench_repo_readme",
+      "allowed_tools": ["patch_file", "read_file"],
+      "step_budget": 5,
+      "expected_artifact": "README.md reflects recovery after invalid patch args",
+      "verifier": "python3 -c \"from pathlib import Path; text = Path('README.md').read_text(encoding='utf-8'); assert 'recovered after invalid patch args' in text\"",
+      "category": "tool-boundary"
+    },
+    {
+      "id": "path_escape_recovery",
+      "prompt": "Reject a path escape attempt and still finish the sample.txt patch.",
+      "fixture_repo": "tests/fixtures/bench_repo_patch",
+      "allowed_tools": ["read_file", "patch_file"],
+      "step_budget": 5,
+      "expected_artifact": "sample.txt reflects recovery after path escape rejection",
+      "verifier": "python3 -c \"from pathlib import Path; text = Path('sample.txt').read_text(encoding='utf-8'); assert 'alpha-guarded' in text\"",
+      "category": "tool-boundary"
+    },
+    {
+      "id": "repeated_read_recovery",
+      "prompt": "Recover after repeated identical reads and still finish the sample.txt patch.",
+      "fixture_repo": "tests/fixtures/bench_repo_patch",
+      "allowed_tools": ["read_file", "patch_file"],
+      "step_budget": 6,
+      "expected_artifact": "sample.txt reflects recovery after repeated identical read rejection",
+      "verifier": "python3 -c \"from pathlib import Path; text = Path('sample.txt').read_text(encoding='utf-8'); assert 'repeat-guarded' in text\"",
+      "category": "tool-boundary"
+    },
+    {
+      "id": "context_reduction_checkpoint",
+      "prompt": "Finish the README update after prompt compression creates a checkpoint.",
+      "fixture_repo": "tests/fixtures/bench_repo_readme",
+      "allowed_tools": ["read_file"],
+      "step_budget": 2,
+      "expected_artifact": "README.md remains available while context reduction creates a checkpoint",
+      "verifier": "python3 -c \"import json; from pathlib import Path; report = json.loads(next(Path('.forge/runs').glob('*/report.json')).read_text(encoding='utf-8')); trace = [json.loads(line) for line in next(Path('.forge/runs').glob('*/trace.jsonl')).read_text(encoding='utf-8').splitlines()]; assert report['checkpoint_id']; assert any(event.get('event') == 'checkpoint_created' and event.get('trigger') == 'context_reduction' for event in trace)\"",
+      "category": "recovery",
+      "setup": {
+        "kind": "context_reduction",
+        "history_count": 12,
+        "note_count": 6,
+        "total_budget": 700,
+        "section_budgets": {
+          "prefix": 800,
+          "memory": 800,
+          "relevant_memory": 800,
+          "history": 2400
+        }
+      }
+    },
+    {
+      "id": "freshness_reanchor_resume",
+      "prompt": "Resume the stale benchmark task and finish without trusting the old summary.",
+      "fixture_repo": "tests/fixtures/bench_repo_patch",
+      "allowed_tools": ["read_file"],
+      "step_budget": 3,
+      "expected_artifact": "sample.txt exists after stale freshness recovery",
+      "verifier": "python3 -c \"import json; from pathlib import Path; report = json.loads(next(Path('.forge/runs').glob('*/report.json')).read_text(encoding='utf-8')); trace = [json.loads(line) for line in next(Path('.forge/runs').glob('*/trace.jsonl')).read_text(encoding='utf-8').splitlines()]; assert report['prompt_metadata']['resume_status'] == 'partial-stale'; assert any(event.get('event') == 'checkpoint_created' and event.get('trigger') == 'freshness_mismatch' for event in trace)\"",
+      "category": "recovery",
+      "setup": {
+        "kind": "freshness_mismatch",
+        "path": "sample.txt",
+        "summary": "sample.txt: benchmark stale summary",
+        "mutated_text": "alpha\nbeta\ngamma\nstale-updated\n"
+      }
+    },
+    {
+      "id": "workspace_mismatch_resume",
+      "prompt": "Resume after benchmark workspace drift and rebuild runtime state.",
+      "fixture_repo": "tests/fixtures/bench_repo_readme",
+      "allowed_tools": ["read_file"],
+      "step_budget": 3,
+      "expected_artifact": "README.md exists after workspace mismatch recovery",
+      "verifier": "python3 -c \"import json; from pathlib import Path; report = json.loads(next(Path('.forge/runs').glob('*/report.json')).read_text(encoding='utf-8')); trace = [json.loads(line) for line in next(Path('.forge/runs').glob('*/trace.jsonl')).read_text(encoding='utf-8').splitlines()]; assert report['prompt_metadata']['resume_status'] == 'workspace-mismatch'; assert any(event.get('event') == 'runtime_identity_mismatch' for event in trace)\"",
+      "category": "recovery",
+      "setup": {
+        "kind": "workspace_mismatch"
+      }
+    },
+    {
+      "id": "durable_promotion_accept",
+      "prompt": "Capture the stable benchmark facts as durable memory and respond with only the promoted facts.",
+      "fixture_repo": "tests/fixtures/bench_repo_readme",
+      "allowed_tools": ["read_file"],
+      "step_budget": 2,
+      "expected_artifact": "README.md fixture stays available while durable promotion succeeds",
+      "verifier": "python3 -c \"import json; from pathlib import Path; report = json.loads(next(Path('.forge/runs').glob('*/report.json')).read_text(encoding='utf-8')); conventions = Path('.forge/memory/topics/project-conventions.md').read_text(encoding='utf-8'); assert len(report['durable_promotions']) == 2; assert 'Preserve benchmark regression artifacts under artifacts/.' in conventions\"",
+      "category": "durable-contract"
+    },
+    {
+      "id": "durable_promotion_reject",
+      "prompt": "Capture only the stable benchmark facts into durable memory and reject anything transient or secret-shaped.",
+      "fixture_repo": "tests/fixtures/bench_repo_readme",
+      "allowed_tools": ["read_file"],
+      "step_budget": 2,
+      "expected_artifact": "README.md fixture stays available while durable rejection is recorded",
+      "verifier": "python3 -c \"import json; from pathlib import Path; report = json.loads(next(Path('.forge/runs').glob('*/report.json')).read_text(encoding='utf-8')); assert report['durable_rejections'] == ['dependency-facts:secret_shaped', 'key-decisions:transient_task_state']; assert report['durable_promotions'] == ['project-conventions: Keep verifier outcomes stable across reruns.']\"",
+      "category": "durable-contract"
+    },
+    {
+      "id": "context_history_only_recall",
+      "prompt": "Recall the history-only benchmark fact without using memory.",
+      "fixture_repo": "tests/fixtures/bench_repo_readme",
+      "allowed_tools": ["read_file"],
+      "step_budget": 2,
+      "expected_artifact": "README.md fixture stays available while history-only recall is probed",
+      "verifier": "python3 -c \"import json; from pathlib import Path; report = json.loads(next(Path('.forge/runs').glob('*/report.json')).read_text(encoding='utf-8')); probe = report['prompt_metadata']['context_probe']; assert probe['memory_disabled']; assert probe['history_fact_seen']; assert report['final_answer'] == 'history-only fact is amber.'\"",
+      "category": "context",
+      "setup": {
+        "kind": "history_only_recall",
+        "fact": "history-only fact is amber"
+      }
+    },
+    {
+      "id": "context_old_history_compressed_recall",
+      "prompt": "Recall the old compressed history fact without rereading.",
+      "fixture_repo": "tests/fixtures/bench_repo_readme",
+      "allowed_tools": ["read_file"],
+      "step_budget": 2,
+      "expected_artifact": "README.md fixture stays available while old history recall is probed",
+      "verifier": "python3 -c \"import json; from pathlib import Path; report = json.loads(next(Path('.forge/runs').glob('*/report.json')).read_text(encoding='utf-8')); meta = report['prompt_metadata']; probe = meta['context_probe']; assert probe['old_history_fact_seen']; assert meta['history']['older_entries_count'] > 0; assert report['final_answer'] == 'old-compressed fact is cedar.'\"",
+      "category": "context",
+      "setup": {
+        "kind": "old_history_compressed_recall",
+        "fact": "old-compressed fact is cedar",
+        "filler_turns": 7
+      }
+    },
+    {
+      "id": "context_large_tool_output_reduction",
+      "prompt": "Continue after a huge prior read without carrying the raw payload.",
+      "fixture_repo": "tests/fixtures/bench_repo_readme",
+      "allowed_tools": ["read_file"],
+      "step_budget": 2,
+      "expected_artifact": "README.md fixture stays available while large tool output is reduced",
+      "verifier": "python3 -c \"import json; from pathlib import Path; report = json.loads(next(Path('.forge/runs').glob('*/report.json')).read_text(encoding='utf-8')); meta = report['prompt_metadata']; probe = meta['context_probe']; assert probe['large_raw_payload_absent']; assert probe['large_summary_seen']; assert meta['history']['reused_file_summary_count'] >= 1; assert report['final_answer'] == 'large output reduced.'\"",
+      "category": "context",
+      "setup": {
+        "kind": "large_tool_output_reduction",
+        "path": "large.txt",
+        "summary": "compact-safe summary marker",
+        "payload_chars": 5000
+      }
+    },
+    {
+      "id": "context_relevant_memory_selection",
+      "prompt": "Recall the silver context fact and ignore unrelated notes.",
+      "fixture_repo": "tests/fixtures/bench_repo_readme",
+      "allowed_tools": ["read_file"],
+      "step_budget": 2,
+      "expected_artifact": "README.md fixture stays available while relevant memory selection is probed",
+      "verifier": "python3 -c \"import json; from pathlib import Path; report = json.loads(next(Path('.forge/runs').glob('*/report.json')).read_text(encoding='utf-8')); meta = report['prompt_metadata']; probe = meta['context_probe']; selected = meta['relevant_memory']['selected_notes']; assert probe['relevant_fact_seen']; assert probe['irrelevant_fact_absent']; assert meta['relevant_memory']['selected_count'] >= 1; assert not any('team mascot' in note for note in selected); assert report['final_answer'] == 'relevant memory selected.'\"",
+      "category": "context",
+      "setup": {
+        "kind": "relevant_memory_selection",
+        "selected": "selected context fact is silver",
+        "irrelevant": "team mascot is orange",
+        "irrelevant_count": 8
+      }
+    },
+    {
+      "id": "context_current_request_preserved_under_pressure",
+      "prompt": "Keep this exact current request intact: pressure-request-sentinel-omega.",
+      "fixture_repo": "tests/fixtures/bench_repo_readme",
+      "allowed_tools": ["read_file"],
+      "step_budget": 2,
+      "expected_artifact": "README.md fixture stays available while current request preservation is probed",
+      "verifier": "python3 -c \"import json; from pathlib import Path; report = json.loads(next(Path('.forge/runs').glob('*/report.json')).read_text(encoding='utf-8')); meta = report['prompt_metadata']; probe = meta['context_probe']; assert probe['current_request_preserved']; assert probe['pressure_sentinel_seen']; assert meta['current_request']['text'].endswith('pressure-request-sentinel-omega.'); assert report['final_answer'] == 'current request preserved.'\"",
+      "category": "context",
+      "setup": {
+        "kind": "current_request_pressure",
+        "history_count": 10,
+        "note_count": 6,
+        "total_budget": 900
+      }
+    },
+    {
+      "id": "context_stale_summary_reanchor",
+      "prompt": "Re-anchor the stale context summary before continuing.",
+      "fixture_repo": "tests/fixtures/bench_repo_patch",
+      "allowed_tools": ["read_file"],
+      "step_budget": 3,
+      "expected_artifact": "sample.txt exists while stale context summary is re-anchored",
+      "verifier": "python3 -c \"import json; from pathlib import Path; report = json.loads(next(Path('.forge/runs').glob('*/report.json')).read_text(encoding='utf-8')); trace = [json.loads(line) for line in next(Path('.forge/runs').glob('*/trace.jsonl')).read_text(encoding='utf-8').splitlines()]; assert report['prompt_metadata']['resume_status'] == 'partial-stale'; assert any(event.get('event') == 'checkpoint_created' and event.get('trigger') == 'freshness_mismatch' for event in trace)\"",
+      "category": "context",
+      "setup": {
+        "kind": "freshness_mismatch",
+        "path": "sample.txt",
+        "summary": "sample.txt: stale context summary",
+        "mutated_text": "alpha\nbeta\ngamma\ncontext-stale-updated\n"
+      }
+    }
+  ]
+}

@@ -1,0 +1,71 @@
+{
+  "schema_version": 1,
+  "description": "Long-chain action benchmark v1 for measuring whether Forge can continue real read/patch/verify tasks after long history pressure.",
+  "tasks": [
+    {
+      "id": "long_chain_action_fix_after_failure",
+      "prompt": "Continue the long-chain sample.txt repair from the recorded failure and finish with verification.",
+      "fixture_repo": "tests/fixtures/bench_repo_patch",
+      "allowed_tools": ["read_file", "patch_file", "run_shell"],
+      "step_budget": 6,
+      "expected_artifact": "sample.txt contains beta-locked after long-chain failure repair",
+      "verifier": "python3 -c \"import json; from pathlib import Path; text = Path('sample.txt').read_text(encoding='utf-8'); report = json.loads(next(Path('.forge/runs').glob('*/report.json')).read_text(encoding='utf-8')); trace = [json.loads(line) for line in next(Path('.forge/runs').glob('*/trace.jsonl')).read_text(encoding='utf-8').splitlines()]; names = [event.get('name') for event in trace if event.get('event') == 'tool_executed']; assert 'beta-locked' in text; assert names[:3] == ['read_file', 'patch_file', 'run_shell']; assert report['tool_steps'] == 3; assert report['stop_reason'] == 'final_answer_returned'\"",
+      "category": "long-chain-action",
+      "setup": {
+        "kind": "long_chain_action_failure_history",
+        "history_turns": 36,
+        "last_failure": "long-chain action failure expected beta-locked but saw beta",
+        "changed_file": "sample.txt",
+        "next_step": "read sample.txt, patch beta to beta-locked, then run verification"
+      }
+    },
+    {
+      "id": "long_chain_action_stale_reanchor_then_patch",
+      "prompt": "Re-anchor sample.txt before patching the current stale target.",
+      "fixture_repo": "tests/fixtures/bench_repo_patch",
+      "allowed_tools": ["read_file", "patch_file"],
+      "step_budget": 5,
+      "expected_artifact": "sample.txt uses current reanchored target instead of stale summary target",
+      "verifier": "python3 -c \"import json; from pathlib import Path; text = Path('sample.txt').read_text(encoding='utf-8'); report = json.loads(next(Path('.forge/runs').glob('*/report.json')).read_text(encoding='utf-8')); trace = [json.loads(line) for line in next(Path('.forge/runs').glob('*/trace.jsonl')).read_text(encoding='utf-8').splitlines()]; names = [event.get('name') for event in trace if event.get('event') == 'tool_executed']; assert report['prompt_metadata']['resume_status'] == 'partial-stale'; assert any(event.get('event') == 'checkpoint_created' and event.get('trigger') == 'freshness_mismatch' for event in trace); assert names[:2] == ['read_file', 'patch_file']; assert 'reanchored-target' in text; assert 'stale-target' not in text; assert 'placeholder-locked' not in text\"",
+      "category": "long-chain-action",
+      "setup": {
+        "kind": "long_chain_action_stale_patch",
+        "path": "sample.txt",
+        "summary": "sample.txt stale summary says placeholder is the patch target",
+        "mutated_text": "alpha\nbeta\ngamma\nstale-target\n",
+        "history_turns": 30
+      }
+    },
+    {
+      "id": "long_chain_action_constraint_no_forbidden_edit",
+      "prompt": "Continue the constrained README update. Do not modify the opening sentence; only replace the first Notes bullet with an allowed long-chain note.",
+      "fixture_repo": "tests/fixtures/bench_repo_readme",
+      "allowed_tools": ["read_file", "patch_file"],
+      "step_budget": 5,
+      "expected_artifact": "README opening sentence is preserved while allowed note is patched",
+      "verifier": "python3 -c \"import json; from pathlib import Path; text = Path('README.md').read_text(encoding='utf-8'); report = json.loads(next(Path('.forge/runs').glob('*/report.json')).read_text(encoding='utf-8')); trace = [json.loads(line) for line in next(Path('.forge/runs').glob('*/trace.jsonl')).read_text(encoding='utf-8').splitlines()]; names = [event.get('name') for event in trace if event.get('event') == 'tool_executed']; assert 'This is a placeholder benchmark fixture.' in text; assert '- Long-chain constrained note is allowed.' in text; assert names[:2] == ['read_file', 'patch_file']; assert report['stop_reason'] == 'final_answer_returned'\"",
+      "category": "long-chain-action",
+      "setup": {
+        "kind": "long_chain_action_constraint_history",
+        "history_turns": 42,
+        "constraint": "do not modify the opening sentence",
+        "stale_plan": "old plan incorrectly suggested replacing the opening sentence"
+      }
+    },
+    {
+      "id": "long_chain_action_failed_verification_then_repair",
+      "prompt": "Continue the long-chain calculator bugfix, recover after failed verification, and finish only after tests pass.",
+      "fixture_repo": "tests/fixtures/bench_repo_bugfix_py",
+      "allowed_tools": ["read_file", "patch_file", "run_shell"],
+      "step_budget": 8,
+      "expected_artifact": "calculator.py is repaired after failed verification and passing verification is recorded",
+      "verifier": "python3 -c \"import json; from pathlib import Path; text = Path('calculator.py').read_text(encoding='utf-8'); report = json.loads(next(Path('.forge/runs').glob('*/report.json')).read_text(encoding='utf-8')); ledger = report['bug_fix_ledger']; trace = [json.loads(line) for line in next(Path('.forge/runs').glob('*/trace.jsonl')).read_text(encoding='utf-8').splitlines()]; shell_count = sum(1 for event in trace if event.get('event') == 'tool_executed' and event.get('name') == 'run_shell'); assert 'return a + b' in text; assert shell_count >= 2; assert ledger['failing_evidence']; assert ledger['passing_evidence']; assert ledger['verify_required'] is False\"",
+      "category": "long-chain-action",
+      "setup": {
+        "kind": "long_chain_action_bugfix_history",
+        "history_turns": 34,
+        "last_failure": "calculator add regression still failing after first attempted repair"
+      }
+    }
+  ]
+}

@@ -1,0 +1,14 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python3 *)",
+      "Bash(python *)",
+      "Bash(HOME=\"$PWD/tmp/home\" USERPROFILE=\"$PWD/tmp/home\" python *)",
+      "Bash(uv run *)",
+      "WebSearch",
+      "WebFetch(domain:diwang.info)",
+      "WebFetch(domain:cloud.tencent.cn)",
+      "WebFetch(domain:www.53ai.com)"
+    ]
+  }
+}

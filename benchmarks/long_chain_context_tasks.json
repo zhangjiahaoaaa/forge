@@ -1,0 +1,81 @@
+{
+  "schema_version": 1,
+  "description": "Long-chain context benchmark v1 for measuring whether Forge preserves task state, stale-summary recovery, and user constraints before Run Brief optimization.",
+  "tasks": [
+    {
+      "id": "long_chain_next_step_after_failure",
+      "prompt": "Continue the long-chain failure repair task without starting over.",
+      "fixture_repo": "tests/fixtures/bench_repo_patch",
+      "allowed_tools": ["read_file", "patch_file", "run_shell"],
+      "step_budget": 3,
+      "expected_artifact": "sample.txt remains available while long-chain failure state is probed",
+      "verifier": "python3 -c \"import json; from pathlib import Path; report = json.loads(next(Path('.forge/runs').glob('*/report.json')).read_text(encoding='utf-8')); probe = report['prompt_metadata']['long_chain_probe']; assert probe['last_failure_seen']; assert probe['changed_file_seen']; assert probe['next_step_seen']; assert probe['verification_constraint_seen']; assert len(report['prompt_metadata']['budget_reductions']) > 0; assert report['final_answer'] == 'long-chain failure state preserved.'\"",
+      "category": "long-chain-context",
+      "setup": {
+        "kind": "long_chain_failure_state",
+        "history_turns": 40,
+        "total_budget": 2200,
+        "section_budgets": {
+          "prefix": 420,
+          "memory": 520,
+          "skills": 120,
+          "relevant_memory": 120,
+          "history": 900
+        },
+        "changed_file": "sample.txt",
+        "last_failure": "long-chain failure sentinel expected beta-locked but saw beta",
+        "next_step": "next step is inspect sample.txt before final",
+        "verification_constraint": "must run verification before final"
+      }
+    },
+    {
+      "id": "long_chain_stale_summary_reanchor",
+      "prompt": "Continue the long-chain stale summary task after checking freshness.",
+      "fixture_repo": "tests/fixtures/bench_repo_patch",
+      "allowed_tools": ["read_file"],
+      "step_budget": 3,
+      "expected_artifact": "sample.txt remains available while stale summary recovery is probed",
+      "verifier": "python3 -c \"import json; from pathlib import Path; report = json.loads(next(Path('.forge/runs').glob('*/report.json')).read_text(encoding='utf-8')); trace = [json.loads(line) for line in next(Path('.forge/runs').glob('*/trace.jsonl')).read_text(encoding='utf-8').splitlines()]; probe = report['prompt_metadata']['long_chain_probe']; assert report['prompt_metadata']['resume_status'] == 'partial-stale'; assert probe['current_request_seen']; assert probe['stale_summary_seen']; assert report['checkpoint_id']; assert any(event.get('event') == 'checkpoint_created' and event.get('trigger') == 'freshness_mismatch' for event in trace); assert report['final_answer'] == 'long-chain stale summary reanchored.'\"",
+      "category": "long-chain-context",
+      "setup": {
+        "kind": "long_chain_stale_summary",
+        "path": "sample.txt",
+        "summary": "sample.txt: stale long-chain summary says beta is unchanged",
+        "mutated_text": "alpha\nbeta\ngamma\nlong-chain-stale-updated\n",
+        "history_turns": 40,
+        "total_budget": 2200,
+        "section_budgets": {
+          "prefix": 400,
+          "memory": 520,
+          "skills": 120,
+          "relevant_memory": 120,
+          "history": 880
+        }
+      }
+    },
+    {
+      "id": "long_chain_user_constraint_preserved",
+      "prompt": "Continue the constrained long-chain task. Constraint: do not modify README public API wording; only inspect state.",
+      "fixture_repo": "tests/fixtures/bench_repo_readme",
+      "allowed_tools": ["read_file", "patch_file"],
+      "step_budget": 3,
+      "expected_artifact": "README.md remains unchanged while user constraint preservation is probed",
+      "verifier": "python3 -c \"import json; from pathlib import Path; report = json.loads(next(Path('.forge/runs').glob('*/report.json')).read_text(encoding='utf-8')); probe = report['prompt_metadata']['long_chain_probe']; readme = Path('README.md').read_text(encoding='utf-8'); assert probe['current_constraint_seen']; assert probe['history_constraint_seen']; assert 'This is a placeholder benchmark fixture.' in readme; assert report['context_metrics']['budget_reduction_count'] > 0; assert report['final_answer'] == 'long-chain user constraint preserved.'\"",
+      "category": "long-chain-context",
+      "setup": {
+        "kind": "long_chain_user_constraint",
+        "history_turns": 60,
+        "constraint": "do not modify README public API wording",
+        "filler_chars": 240,
+        "total_budget": 2600,
+        "section_budgets": {
+          "prefix": 360,
+          "memory": 480,
+          "skills": 120,
+          "relevant_memory": 120,
+          "history": 1520
+        }
+      }
+    }
+  ]
+}

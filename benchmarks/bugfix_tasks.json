@@ -1,0 +1,86 @@
+{
+  "schema_version": 1,
+  "description": "Bugfix verification benchmark v1 for Forge runtime guardrails. Tasks focus on Bug Fix Ledger, verify-before-final behavior, verification command classification, and evidence artifacts.",
+  "tasks": [
+    {
+      "id": "bugfix_requires_verification_after_patch",
+      "prompt": "Fix the failing calculator add bug and verify the fix before final.",
+      "fixture_repo": "tests/fixtures/bench_repo_bugfix_py",
+      "allowed_tools": ["read_file", "patch_file", "run_shell"],
+      "step_budget": 6,
+      "expected_artifact": "calculator.py add returns a + b and verification passes",
+      "verifier": "python3 -c \"import json; from pathlib import Path; text = Path('calculator.py').read_text(encoding='utf-8'); report = json.loads(next(Path('.forge/runs').glob('*/report.json')).read_text(encoding='utf-8')); trace = [json.loads(line) for line in next(Path('.forge/runs').glob('*/trace.jsonl')).read_text(encoding='utf-8').splitlines()]; ledger = report['bug_fix_ledger']; assert 'return a + b' in text; assert ledger['guard_triggered']; assert ledger['passing_evidence']; assert ledger['verify_required'] is False; assert any(event.get('event') == 'bug_fix_guard_triggered' for event in trace)\"",
+      "category": "bugfix-verification"
+    },
+    {
+      "id": "bugfix_failed_verification_keeps_guard",
+      "prompt": "Fix the failing calculator add regression, recover after a failed verification, and finish only after tests pass.",
+      "fixture_repo": "tests/fixtures/bench_repo_bugfix_py",
+      "allowed_tools": ["read_file", "patch_file", "run_shell"],
+      "step_budget": 8,
+      "expected_artifact": "failed verification keeps guard active until corrected patch passes",
+      "verifier": "python3 -c \"import json; from pathlib import Path; text = Path('calculator.py').read_text(encoding='utf-8'); report = json.loads(next(Path('.forge/runs').glob('*/report.json')).read_text(encoding='utf-8')); ledger = report['bug_fix_ledger']; assert 'return a + b' in text; assert ledger['guard_triggered']; assert ledger['failing_evidence']; assert ledger['passing_evidence']; assert ledger['verify_required'] is False\"",
+      "category": "bugfix-verification"
+    },
+    {
+      "id": "bugfix_records_reproduction_before_patch",
+      "prompt": "Reproduce the calculator add failure, fix it, and verify the regression test passes.",
+      "fixture_repo": "tests/fixtures/bench_repo_bugfix_py",
+      "allowed_tools": ["read_file", "patch_file", "run_shell"],
+      "step_budget": 6,
+      "expected_artifact": "ledger records reproduction command, failure evidence, and passing evidence",
+      "verifier": "python3 -c \"import json; from pathlib import Path; report = json.loads(next(Path('.forge/runs').glob('*/report.json')).read_text(encoding='utf-8')); ledger = report['bug_fix_ledger']; assert 'pytest' in ledger['reproduction_command']; assert ledger['failing_evidence']; assert ledger['passing_evidence']; assert ledger['verification_command']\"",
+      "category": "bugfix-verification"
+    },
+    {
+      "id": "docs_fix_does_not_require_test",
+      "prompt": "Fix the typo in README only.",
+      "fixture_repo": "tests/fixtures/bench_repo_bugfix_py",
+      "allowed_tools": ["read_file", "patch_file"],
+      "step_budget": 4,
+      "expected_artifact": "README typo is fixed without requiring code verification",
+      "verifier": "python3 -c \"import json; from pathlib import Path; readme = Path('README.md').read_text(encoding='utf-8'); report = json.loads(next(Path('.forge/runs').glob('*/report.json')).read_text(encoding='utf-8')); ledger = report['bug_fix_ledger']; assert 'typo for the docs-only benchmark' in readme; assert not ledger.get('guard_triggered'); assert report['stop_reason'] == 'final_answer_returned'\"",
+      "category": "bugfix-verification"
+    },
+    {
+      "id": "non_bug_feature_edit_not_guarded",
+      "prompt": "Add a short usage note to the README.",
+      "fixture_repo": "tests/fixtures/bench_repo_bugfix_py",
+      "allowed_tools": ["read_file", "patch_file"],
+      "step_budget": 4,
+      "expected_artifact": "non-bug README edit is not guarded as a bugfix",
+      "verifier": "python3 -c \"import json; from pathlib import Path; readme = Path('README.md').read_text(encoding='utf-8'); report = json.loads(next(Path('.forge/runs').glob('*/report.json')).read_text(encoding='utf-8')); ledger = report['bug_fix_ledger']; assert 'Usage note: run tests before release.' in readme; assert not ledger.get('active'); assert not ledger.get('guard_triggered')\"",
+      "category": "bugfix-verification"
+    },
+    {
+      "id": "echo_test_does_not_satisfy_verification",
+      "prompt": "Fix the calculator add bug; do not accept fake verification commands.",
+      "fixture_repo": "tests/fixtures/bench_repo_bugfix_py",
+      "allowed_tools": ["read_file", "patch_file", "run_shell"],
+      "step_budget": 7,
+      "expected_artifact": "echo test does not satisfy verification and real pytest is required",
+      "verifier": "python3 -c \"import json; from pathlib import Path; report = json.loads(next(Path('.forge/runs').glob('*/report.json')).read_text(encoding='utf-8')); ledger = report['bug_fix_ledger']; assert ledger['guard_triggered']; assert ledger['verification_command'].startswith('python -m pytest'); assert ledger['passing_evidence']; assert ledger['verify_required'] is False\"",
+      "category": "bugfix-verification"
+    },
+    {
+      "id": "py_compile_counts_as_verification",
+      "prompt": "Fix the calculator add bug and use a lightweight Python compile verification before final.",
+      "fixture_repo": "tests/fixtures/bench_repo_bugfix_py",
+      "allowed_tools": ["read_file", "patch_file", "run_shell"],
+      "step_budget": 5,
+      "expected_artifact": "py_compile counts as verification for Python edit",
+      "verifier": "python3 -c \"import json; from pathlib import Path; report = json.loads(next(Path('.forge/runs').glob('*/report.json')).read_text(encoding='utf-8')); ledger = report['bug_fix_ledger']; assert 'py_compile' in ledger['verification_command']; assert ledger['passing_evidence']; assert ledger['verify_required'] is False\"",
+      "category": "bugfix-verification"
+    },
+    {
+      "id": "long_test_output_saved_and_ledger_links_artifact",
+      "prompt": "Fix the calculator add bug and run the verbose regression test so long verification output is preserved as an artifact.",
+      "fixture_repo": "tests/fixtures/bench_repo_bugfix_py",
+      "allowed_tools": ["read_file", "patch_file", "run_shell"],
+      "step_budget": 5,
+      "expected_artifact": "long verification output is saved and linked from ledger/report",
+      "verifier": "python3 -c \"import json; from pathlib import Path; report = json.loads(next(Path('.forge/runs').glob('*/report.json')).read_text(encoding='utf-8')); ledger = report['bug_fix_ledger']; artifacts = report.get('output_artifacts', []); assert ledger['passing_evidence']; assert ledger.get('passing_artifact'); assert any(item.get('path') == ledger['passing_artifact'] for item in artifacts); assert Path(ledger['passing_artifact']).read_text(encoding='utf-8').count('LONG-VERIFICATION-LINE') >= 100\"",
+      "category": "bugfix-verification"
+    }
+  ]
+}
