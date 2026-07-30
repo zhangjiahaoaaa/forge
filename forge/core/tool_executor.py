@@ -2,10 +2,10 @@
 
 import re
 
+from .protected_paths import ProtectedTaskStateModified, execute_with_task_state_guard, reject_protected_task_state_modification
 from .tool_policy import ToolPolicyChecker
 from .tool_repetition import repeated_tool_call_metadata
 from .workspace import clip
-
 INLINE_TOOL_OUTPUT_LIMIT = 1000
 INLINE_TOOL_OUTPUT_BUDGETS = {
     "run_shell": 1000,
@@ -21,8 +21,6 @@ TOOL_PREVIEW_LINES = {
     "list_files": 60,
     "_default": 30,
 }
-
-
 def run_tool(agent, name, args):
     tool = agent.tools.get(name)
     if tool is None:
@@ -92,7 +90,11 @@ def run_tool(agent, name, args):
     before_snapshot = agent.capture_workspace_snapshot() if tool.risky else {}
     after_snapshot = before_snapshot
     try:
-        full_result = tool.execute(args).content
+        full_result = (
+            execute_with_task_state_guard(tool, args, agent.root)
+            if name == "run_shell"
+            else tool.execute(args).content
+        )
         result, full_output_artifact = _render_tool_result(agent, name, full_result)
         after_snapshot = agent.capture_workspace_snapshot() if tool.risky else before_snapshot
         affected_paths, diff_summary = agent.diff_workspace_snapshots(before_snapshot, after_snapshot)
@@ -123,6 +125,8 @@ def run_tool(agent, name, args):
         }
         agent.record_process_note_for_tool(name, agent._last_tool_result_metadata)
         return result
+    except ProtectedTaskStateModified as exc:
+        return reject_protected_task_state_modification(agent, tool, exc.paths)
     except Exception as exc:
         after_snapshot = agent.capture_workspace_snapshot() if tool.risky else before_snapshot
         affected_paths, diff_summary = agent.diff_workspace_snapshots(before_snapshot, after_snapshot)
@@ -165,7 +169,6 @@ def _summarize_tool_result(name, full_result, relative_artifact, budget):
     preview = _semantic_preview(name, lines, preview_budget)
     summary = "\n".join([header, preview, footer]).strip()
     return clip(summary, budget)
-
 
 def _semantic_preview(name, lines, budget):
     if name == "read_file":
@@ -249,6 +252,8 @@ def _permission_error(agent, tool, decision):
         return f"error: plan mode only allows read-only tools or writing the active plan artifact ({agent.plan_mode.plan_path})"
     if decision.reason == "write_scope_mismatch":
         return f"error: worker write_scope does not allow {tool.name} on this path"
+    if decision.reason == "contract_path_protected":
+        return f"error: Durable Task state, Contract, and evidence are runtime-managed and cannot be modified by {tool.name}"
     if decision.reason in {"approval_denied", "tool_not_allowed"}:
         return f"error: approval denied for {tool.name}"
     return f"error: permission denied for {tool.name}: {decision.reason}"

@@ -38,6 +38,9 @@ class PermissionChecker:
         if self.runtime.runtime_mode == "plan":
             return self._check_plan(tool, args)
 
+        if tool.name in {"write_file", "patch_file"} and self._is_protected_task_path(args):
+            return PermissionDecision.deny("contract_path_protected", "contract_path_guard")
+
         if tool.name in {"write_file", "patch_file"} and getattr(self.runtime, "write_scope", ()):
             return self._check_write_scope(tool, args)
         if tool.read_only:
@@ -51,6 +54,16 @@ class PermissionChecker:
         if self.runtime.approve(tool.name, args):
             return PermissionDecision.allow("approval_prompt")
         return PermissionDecision.deny("approval_denied", "approval_denied")
+
+    def _is_protected_task_path(self, args):
+        """禁止 Agent 工具修改 Durable Task 元数据、Contract 与验收证据。"""
+        requested = self.runtime.path(args.get("path", ""))
+        protected_root = self.runtime.root / ".forge" / "tasks"
+        try:
+            requested.relative_to(protected_root)
+        except ValueError:
+            return False
+        return True
 
     def _check_plan(self, tool, args):
         if tool.read_only:

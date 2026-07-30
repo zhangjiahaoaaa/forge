@@ -25,7 +25,15 @@ from .config import (
 )
 from .features import skills as skillslib
 from .features.skills_runtime import invoke_skill
+from .features.loop import LoopController, TaskContextBuilder
 from .features.task_record import TaskStore, TaskStatus
+from .features.verification import (
+    AcceptanceContract,
+    ContractStore,
+    ReproductionVerdict,
+    TaskVerificationService,
+    VerifierVerdict,
+)
 from .paths import migrate_workspace_layout, workspace_state_path
 from .providers import AnthropicCompatibleModelClient, OpenAICompatibleModelClient
 from .core.runtime import Pico, SessionStore
@@ -605,18 +613,100 @@ def _cli_ask_user(question, choices):
     return input(question + " ").strip()
 
 
-def _find_task_root(args):
-    """Resolve the .forge/tasks directory from CLI args."""
-    cwd = Path(getattr(args, "cwd", ".") or ".").resolve()
-    from .paths import LEGACY_WORKSPACE_STATE_DIRNAME, WORKSPACE_STATE_DIRNAME
-    for name in (WORKSPACE_STATE_DIRNAME, LEGACY_WORKSPACE_STATE_DIRNAME):
-        candidate = cwd / name
-        if candidate.is_dir():
-            return candidate / "tasks"
-    # Fall back to .forge/tasks in CWD
-    tasks_dir = cwd / WORKSPACE_STATE_DIRNAME / "tasks"
-    tasks_dir.mkdir(parents=True, exist_ok=True)
-    return tasks_dir
+def _task_store_for_workspace(cwd: Path) -> TaskStore:
+    """返回 .forge 下的 TaskStore，并迁移早期 CLI 错放的任务目录。"""
+    from .paths import WORKSPACE_STATE_DIRNAME
+
+    workspace = Path(cwd).resolve()
+    forge_dir = workspace / WORKSPACE_STATE_DIRNAME
+    tasks_dir = forge_dir / "tasks"
+    legacy_dir = workspace / "tasks"
+    if legacy_dir.is_dir():
+        legacy_tasks = [
+            entry for entry in legacy_dir.iterdir()
+            if entry.is_dir() and (entry / "task.json").is_file()
+        ]
+        if legacy_tasks:
+            tasks_dir.mkdir(parents=True, exist_ok=True)
+            collisions = [entry.name for entry in legacy_tasks if (tasks_dir / entry.name).exists()]
+            if collisions:
+                raise RuntimeError(
+                    "cannot migrate legacy task directories with conflicting ids: "
+                    + ", ".join(sorted(collisions))
+                )
+            for entry in legacy_tasks:
+                shutil.move(str(entry), str(tasks_dir / entry.name))
+    forge_dir.mkdir(parents=True, exist_ok=True)
+    return TaskStore(forge_dir)
+
+
+def _build_controller():
+    """从当前工作区构建一个 LoopController。"""
+    cwd = Path.cwd().resolve()
+    from .paths import WORKSPACE_STATE_DIRNAME
+    forge_dir = cwd / WORKSPACE_STATE_DIRNAME
+    forge_dir.mkdir(parents=True, exist_ok=True)
+    tasks_root = forge_dir / "tasks"
+    store = TaskStore(forge_dir)
+    from .features.verification import ContractStore, TaskVerificationService
+    cs = ContractStore(tasks_root)
+    vs = TaskVerificationService(store, cs, cwd, tasks_root)
+
+    def _build_agent():
+        """Build a Forge agent from CLI defaults (no provider override needed)."""
+        parser = build_arg_parser()
+        args = parser.parse_args([])
+        return build_agent(args)
+
+    return LoopController(
+        task_store=store,
+        contract_store=cs,
+        verification_service=vs,
+        context_builder=TaskContextBuilder(),
+        build_agent_fn=_build_agent,
+    )
+
+
+def _main_loop(loop_argv):
+    """Dispatch for 'forge loop <subcommand> [args...]'."""
+    if not loop_argv:
+        print("usage: forge loop advance|run <task_id>", file=sys.stderr)
+        return 1
+
+    cmd = loop_argv[0].lower()
+    args = loop_argv[1:]
+    if not args:
+        print("error: task_id is required", file=sys.stderr)
+        return 1
+    task_id = args[0]
+
+    controller = _build_controller()
+
+    if cmd == "advance":
+        result = controller.advance(task_id)
+        task = result.get("task")
+        print(f"action:   {result.get('action', '?')}")
+        print(f"reason:   {result.get('reason', '?')}")
+        if task:
+            print(f"status:   {getattr(task, 'status', '?')}")
+            print(f"phase:    {getattr(task, 'phase', '?')}")
+            print(f"cycle:    {getattr(task, 'cycle', 0)}")
+        return 0
+
+    if cmd == "run":
+        prompt = " ".join(args[1:]).strip() if len(args) > 1 else None
+        result = controller.advance_full(task_id, run_prompt=prompt)
+        task = result.get("task")
+        print(f"action:   {result.get('action', '?')}")
+        print(f"reason:   {result.get('reason', '?')}")
+        if task:
+            print(f"status:   {getattr(task, 'status', '?')}")
+            print(f"phase:    {getattr(task, 'phase', '?')}")
+            print(f"cycle:    {getattr(task, 'cycle', 0)}")
+        return 0 if result.get("action") == "completed" else 1
+
+    print(f"error: unknown loop command: {cmd}", file=sys.stderr)
+    return 1
 
 
 def _main_task(task_argv):
@@ -630,10 +720,7 @@ def _main_task(task_argv):
 
     # Resolve task store root from CWD
     cwd = Path.cwd().resolve()
-    from .paths import WORKSPACE_STATE_DIRNAME
-    task_root = cwd / WORKSPACE_STATE_DIRNAME / "tasks"
-    task_root.mkdir(parents=True, exist_ok=True)
-    store = TaskStore(task_root.parent.parent)  # .forge/
+    store = _task_store_for_workspace(cwd)
 
     if cmd == "create":
         goal = " ".join(task_args).strip()
@@ -720,6 +807,22 @@ def _main_task(task_argv):
             print(f"error: {exc}", file=sys.stderr)
             return 1
 
+        if task.status in (TaskStatus.COMPLETED, TaskStatus.FAILED, TaskStatus.BLOCKED):
+            print(f"error: cannot run task in {task.status.value} state", file=sys.stderr)
+            return 1
+        if not task.baseline or task.baseline.get("reproduction_verdict") != ReproductionVerdict.REPRODUCED.value:
+            print("error: run 'forge task reproduce <task_id>' and obtain reproduced first", file=sys.stderr)
+            return 1
+        if not task.contract_hash:
+            print("error: task has no frozen Contract; initialize it before running", file=sys.stderr)
+            return 1
+
+        service = _build_verification_service()
+        if not service.contract_is_intact(task_id, task.contract_hash):
+            print("error: Contract integrity check failed; task is blocked", file=sys.stderr)
+            _block_task(store, task, "contract_integrity_failed")
+            return 1
+
         # Build agent from current environment
         parser = build_arg_parser()
         agent_args = parser.parse_args([])
@@ -734,7 +837,9 @@ def _main_task(task_argv):
         print(f"running task {task_id} ...")
 
         # Engine 创建 Run 身份后、开始写 artifact 或请求模型前立即持久化。
-        # 回调失败会中止执行，避免产生无法映射到 Durable Task 的 Run。
+        trusted_baseline = dict(task.baseline or {})
+        trusted_contract_hash = task.contract_hash
+        trusted_goal = task.goal
         result = agent.ask_run(
             prompt,
             on_run_started=lambda run_id, legacy_task_id: store.record_run_started(
@@ -757,12 +862,275 @@ def _main_task(task_argv):
             artifact_refs=artifact_refs,
         )
 
+        task = store.load_task(task_id)
+        if (
+            task.goal != trusted_goal
+            or task.contract_hash != trusted_contract_hash
+            or task.baseline != trusted_baseline
+        ):
+            _block_task(store, task, "durable_task_state_modified_during_run")
+            print("error: Durable Task state changed during Agent Run; task is blocked", file=sys.stderr)
+            return 1
+
+        verdict, info = service.run_verification(
+            task_id,
+            run_id=result.run_id,
+            expected_contract_hash=trusted_contract_hash,
+            baseline_files=trusted_baseline.get("workspace_files"),
+        )
+        task = store.load_task(task_id)
+        _record_verification_result(store, task, verdict, info, completion_reason="verifier_pass")
+
         print()
         print(result.final_answer)
+        print(f"verify: {verdict.value}")
+        for ref in info.evidence_refs:
+            print(f"  evidence: {ref}")
+        return 0
+
+    # -- PR 2: reproduce / verify --
+
+    if cmd == "reproduce":
+        if not task_args:
+            print("error: task_id is required", file=sys.stderr)
+            return 1
+        task_id = task_args[0]
+        service = _build_verification_service()
+        try:
+            task = store.load_task(task_id)
+        except KeyError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 1
+
+        if not task.contract_hash:
+            print("error: task has no frozen Contract; run 'forge contract init <task_id>' first", file=sys.stderr)
+            return 1
+        repro_verdict, info = service.establish_baseline(
+            task_id,
+            expected_contract_hash=task.contract_hash,
+        )
+        task.baseline = {
+            "commit": info.commit,
+            "workspace_fingerprint": info.workspace_fingerprint,
+            "reproduction_verdict": info.reproduction_verdict,
+            "failure_fingerprint": info.failure_fingerprint,
+            "evidence_ref": info.evidence_ref,
+            "workspace_files": dict(info.workspace_files),
+        }
+        store.save_task(task)
+
+        print(f"reproduce: {repro_verdict.value}")
+        if info.evidence_ref:
+            print(f"evidence:  {info.evidence_ref}")
+
+        if repro_verdict == ReproductionVerdict.REPRODUCED:
+            return 0
+        if repro_verdict == ReproductionVerdict.NOT_REPRODUCED:
+            verdict, verify_info = service.run_verification(
+                task_id,
+                run_id="baseline",
+                expected_contract_hash=task.contract_hash,
+                baseline_files=(task.baseline or {}).get("workspace_files"),
+            )
+            task = store.load_task(task_id)
+            if verdict == VerifierVerdict.PASS:
+                _record_verification_result(
+                    store, task, verdict, verify_info, completion_reason="already_resolved"
+                )
+            else:
+                _record_verification_result(
+                    store, task, verdict, verify_info, completion_reason="baseline_mismatch"
+                )
+            print(f"verify: {verdict.value}")
+            return 0
+
+        task = store.load_task(task_id)
+        _block_task(store, task, f"baseline_{repro_verdict.value}")
+        return 0
+
+    if cmd == "verify":
+        if not task_args:
+            print("error: task_id is required", file=sys.stderr)
+            return 1
+        task_id = task_args[0]
+        run_id = task_args[1] if len(task_args) > 1 else ""
+        service = _build_verification_service()
+        try:
+            task = store.load_task(task_id)
+        except KeyError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 1
+
+        if task.status in (TaskStatus.COMPLETED, TaskStatus.FAILED, TaskStatus.BLOCKED):
+            print(f"error: cannot verify task in {task.status.value} state", file=sys.stderr)
+            return 1
+        if not task.baseline or task.baseline.get("reproduction_verdict") != ReproductionVerdict.REPRODUCED.value:
+            print("error: reproduce must be stably reproduced before verification", file=sys.stderr)
+            return 1
+        if not task.contract_hash:
+            print("error: task has no frozen Contract", file=sys.stderr)
+            return 1
+        verdict, info = service.run_verification(
+            task_id,
+            run_id=run_id,
+            expected_contract_hash=task.contract_hash,
+            baseline_files=(task.baseline or {}).get("workspace_files"),
+        )
+        _record_verification_result(store, task, verdict, info, completion_reason="verifier_pass")
+        print(f"verify: {verdict.value}")
+        if info.evidence_refs:
+            for r in info.evidence_refs:
+                print(f"  evidence: {r}")
         return 0
 
     print(f"error: unknown task command: {cmd}", file=sys.stderr)
     return 1
+
+
+def _record_verification_result(store, task, verdict, info, completion_reason):
+    """持久化外部验收结果；只有 PASS 可自动完成 Task。
+
+    非 PASS verdict 显式将状态复位为 IN_PROGRESS（除非原本就是终端状态），
+    防止 Agent 在 Run 期间篡改 task.json 的 status 字段后验收失败仍遗留 COMPLETED。
+    """
+    task.last_verdict = {
+        "verdict": info.verdict or verdict.value,
+        "checked_at": info.checked_at,
+        "evidence_refs": list(info.evidence_refs),
+    }
+    if verdict == VerifierVerdict.PASS:
+        task.status = TaskStatus.COMPLETED
+        task.phase = ""
+        task.completion_reason = completion_reason
+    elif completion_reason == "baseline_mismatch":
+        task.status = TaskStatus.BLOCKED
+        task.phase = ""
+        task.completion_reason = completion_reason
+    elif verdict in (VerifierVerdict.BLOCKED, VerifierVerdict.INFRA_ERROR):
+        task.status = TaskStatus.BLOCKED
+        task.phase = ""
+        task.completion_reason = info.reason or verdict.value
+    else:
+        # FAIL / FORBIDDEN → 显式复位为 IN_PROGRESS，归还重试可能性
+        if task.status == TaskStatus.COMPLETED:
+            task.status = TaskStatus.IN_PROGRESS
+        task.completion_reason = f"verify_{verdict.value}" if hasattr(verdict, "value") else str(verdict)
+    store.save_task(task)
+
+
+def _block_task(store, task, reason):
+    """记录无法继续自动验收的确定性阻塞原因。"""
+    task.status = TaskStatus.BLOCKED
+    task.completion_reason = reason
+    store.save_task(task)
+
+
+def _build_verification_service() -> TaskVerificationService:
+    """Build a TaskVerificationService from the current workspace."""
+    cwd = Path.cwd().resolve()
+    store = _task_store_for_workspace(cwd)
+    forge_dir = store.root
+    contract_store = ContractStore(forge_dir / "tasks")
+    return TaskVerificationService(
+        task_store=store,
+        contract_store=contract_store,
+        workspace_root=cwd,
+        tasks_root=forge_dir / "tasks",
+    )
+
+
+def _main_contract(contract_argv):
+    """Dispatch for 'forge contract <subcommand> [args...]'."""
+    if not contract_argv:
+        print("usage: forge contract init <task_id> --from <contract.json> | validate <task_id>", file=sys.stderr)
+        return 1
+
+    cmd = contract_argv[0].lower()
+    args = contract_argv[1:]
+
+    if cmd == "init":
+        if not args:
+            print("error: task_id is required", file=sys.stderr)
+            return 1
+        task_id = args[0]
+        source_path = ""
+        index = 1
+        while index < len(args):
+            if args[index] == "--from" and index + 1 < len(args):
+                index += 1
+                source_path = args[index]
+            index += 1
+        if not source_path:
+            print("error: --from <contract.json> is required", file=sys.stderr)
+            return 1
+
+        store_path = _resolve_tasks_root()
+        store = _task_store_for_workspace(Path.cwd())
+        try:
+            task = store.load_task(task_id)
+            source = Path(source_path).resolve()
+            raw_text = source.read_text(encoding="utf-8")
+            if source.suffix.lower() in (".yaml", ".yml"):
+                try:
+                    import yaml
+                    raw_contract = yaml.safe_load(raw_text)
+                except ImportError:
+                    print("error: PyYAML is required for .yaml/.yml files; install with 'pip install pyyaml' or use JSON format", file=sys.stderr)
+                    return 1
+                except yaml.YAMLError as exc:
+                    print(f"error: invalid YAML in {source_path}: {exc}", file=sys.stderr)
+                    return 1
+            else:
+                raw_contract = json.loads(raw_text)
+            contract = AcceptanceContract.from_dict(raw_contract)
+        except (KeyError, OSError, json.JSONDecodeError, ValueError) as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 1
+        if not contract.goal:
+            contract.goal = task.goal
+        if not contract.reproduce_command or not contract.verify_commands:
+            print("error: Contract requires reproduce.command and verify.required", file=sys.stderr)
+            return 1
+
+        cs = ContractStore(store_path)
+        try:
+            cs.save_contract(task_id, contract)
+        except FileExistsError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 1
+        task.contract_hash = contract.content_hash
+        store.save_task(task)
+        print(f"contract initialized for {task_id}")
+        print(f"content_hash: {contract.content_hash[:16]}")
+        return 0
+
+    if cmd == "validate":
+        if not args:
+            print("error: task_id is required", file=sys.stderr)
+            return 1
+        task_id = args[0]
+        cs = ContractStore(_resolve_tasks_root())
+        contract = cs.load_contract(task_id)
+        if contract is None:
+            print("no contract found")
+            return 1
+        print(f"goal:           {contract.goal}")
+        print(f"reproduce:      {contract.reproduce_command or '(none)'}")
+        print(f"verify cmds:    {len(contract.verify_commands)}")
+        print(f"forbidden:      {contract.change_policy.forbidden_paths}")
+        print(f"content_hash:   {contract.content_hash[:16]}")
+        return 0
+
+    print(f"error: unknown contract command: {cmd}", file=sys.stderr)
+    return 1
+
+
+def _resolve_tasks_root() -> Path:
+    """返回当前工作区 Durable Task 文件根目录。"""
+    store = _task_store_for_workspace(Path.cwd())
+    tasks_root = store.root / "tasks"
+    tasks_root.mkdir(parents=True, exist_ok=True)
+    return tasks_root
 
 
 def _drain_idle_worker_notifications(agent):
@@ -783,11 +1151,16 @@ def interaction_mode(args):
 
 
 def main(argv=None):
-    # Detect "forge task ..." before argparse (because prompt nargs="*" consumes it)
+    # Detect "forge task ..." / "forge contract ..." / "forge loop ..." before argparse
     if argv is None:
         argv = sys.argv[1:]
-    if argv and str(argv[0]).lower() == "task":
+    first = argv[0].lower() if argv else ""
+    if first == "task":
         return _main_task(argv[1:])
+    if first == "contract":
+        return _main_contract(argv[1:])
+    if first == "loop":
+        return _main_loop(argv[1:])
 
     args = build_arg_parser().parse_args(argv)
 

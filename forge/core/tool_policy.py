@@ -52,6 +52,12 @@ class ToolPolicyChecker:
                     "shell_search_should_use_tool",
                     "error: run_shell is not for ordinary workspace search/read; use search, read_file, or list_files first",
                 )
+            # 禁止 shell 命令写入 .forge 内部状态目录
+            if _shell_writes_to_forge(command):
+                return ToolPolicyDecision.deny(
+                    "shell_writes_to_forge_state",
+                    "error: shell commands writing to .forge/ internal state are not permitted",
+                )
         return ToolPolicyDecision.allow()
 
     def _has_fresh_read(self, path):
@@ -68,3 +74,20 @@ class ToolPolicyChecker:
             "prior_read_required",
             f"error: {tool_name} requires a fresh read_file of {path} before modifying it",
         )
+
+
+def _shell_writes_to_forge(command: str) -> bool:
+    """检测 shell 命令是否可能写入 .forge 内部状态目录。"""
+    # 检测 write/cp/mv/mkdir/rm/echo >/>> 等写入操作指向 .forge 路径
+    FORGE_WRITE_RE = re.compile(
+        r'(?:^|;|&&|\|\||\|)\s*'
+        r'(?:write|cp|mv|mkdir|rm|touch|echo|cat|tee|sed|awk|python|perl|ruby)'
+        r'(?:.*\s+|\s+)(?:\S*[\\/])?\S*\.forge',
+        re.IGNORECASE,
+    )
+    if FORGE_WRITE_RE.search(command):
+        return True
+    # 检测重定向到 .forge 路径
+    if re.search(r'(?:\s|^)(?:>|>>)\s*(?:\S*[\\/])?\S*\.forge', command):
+        return True
+    return False

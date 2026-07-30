@@ -35,6 +35,7 @@ tmp/
 .pico/
 artifacts/
 readme_intro_locked/
+tasks/
 
 # Local secrets and provider configuration
 .env

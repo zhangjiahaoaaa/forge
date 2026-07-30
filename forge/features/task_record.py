@@ -7,6 +7,7 @@ Run state.  It deliberately has no Engine or Runtime imports.
 from __future__ import annotations
 
 import enum
+import hashlib
 import json
 import os
 import tempfile
@@ -15,15 +16,35 @@ import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Any
 
 
 class TaskStatus(str, enum.Enum):
-    """PR 1 中 Durable Task 的最小业务状态。"""
+    """Durable Task 的业务状态（PR 1 – PR 3）。"""
 
     CREATED = "created"
     IN_PROGRESS = "in_progress"
     COMPLETED = "completed"
     FAILED = "failed"
+    BLOCKED = "blocked"
+    WAITING_HUMAN = "waiting_human"
+
+
+class TaskPhase(str, enum.Enum):
+    """当前执行阶段，与业务状态正交。
+
+    status 回答"业务上怎么了"，phase 回答"流程走到哪了"。
+    一个 in_progress 的任务可以处于不同的 phase。
+    只有 RUNNING 和 VERIFYING 涉及 Agent 调用。
+    """
+
+    BASELINING = "baselining"
+    READY = "ready"
+    RUNNING = "running"
+    VERIFYING = "verifying"
+    ASSESSING_PROGRESS = "assessing_progress"
+    REPLANNING = "replanning"
+    RUN_INTERRUPTED = "run_interrupted"
 
 
 def _now() -> str:
@@ -49,6 +70,30 @@ class TaskRecord:
     run_ids: list[str] = field(default_factory=list)
     last_run_summary: str = ""
 
+    # PR 2 — Acceptance Contract + External Verifier
+    baseline: dict | None = None
+    """基线信息（reproduce 结果、commit、failure_fingerprint）。"""
+    last_verdict: dict | None = None
+    """最近一次验收裁决。"""
+    completion_reason: str | None = None
+    """completed 或 blocked 的具体原因（如 already_resolved, baseline_mismatch）。"""
+
+    # PR 3 — Loop Controller
+    phase: str = ""
+    """当前执行阶段（TaskPhase 值），空字符串表示尚未进入循环。"""
+    cycle: int = 0
+    """业务修复轮次，只在启动新 Agent 尝试时增加。"""
+    max_cycles: int = 4
+    """允许的最大业务轮次。"""
+    policy: dict | None = None
+    """Loop Policy 配置（max_tool_steps, max_wall_time 等）。"""
+    contract_hash: str = ""
+    """Runtime 冻结 Contract 时记录的可信内容哈希。"""
+    replan_already_done: bool = False
+    """是否已执行过一次 REPLAN，重启后仍保留。"""
+    progress_history: list[dict] = field(default_factory=list)
+    """最近的停滞检测信号，跨 CLI 进程保留。"""
+
     def __post_init__(self):
         if not self.created_at:
             self.created_at = _now()
@@ -58,11 +103,11 @@ class TaskRecord:
             self.status = TaskStatus(self.status)
 
     def to_dict(self) -> dict:
-        return {
+        d: dict[str, Any] = {
             "schema_version": self.schema_version,
             "task_id": self.task_id,
             "goal": self.goal,
-            "status": self.status.value,
+            "status": self.status.value if isinstance(self.status, enum.Enum) else str(self.status),
             "revision": self.revision,
             "created_at": self.created_at,
             "updated_at": self.updated_at,
@@ -70,6 +115,27 @@ class TaskRecord:
             "run_ids": list(self.run_ids),
             "last_run_summary": self.last_run_summary,
         }
+        if self.baseline:
+            d["baseline"] = dict(self.baseline)
+        if self.last_verdict:
+            d["last_verdict"] = dict(self.last_verdict)
+        if self.completion_reason:
+            d["completion_reason"] = self.completion_reason
+        if self.contract_hash:
+            d["contract_hash"] = self.contract_hash
+        if self.phase:
+            d["phase"] = self.phase
+        if self.cycle:
+            d["cycle"] = self.cycle
+        if self.max_cycles != 4:
+            d["max_cycles"] = self.max_cycles
+        if self.policy:
+            d["policy"] = dict(self.policy)
+        if self.replan_already_done:
+            d["replan_already_done"] = True
+        if self.progress_history:
+            d["progress_history"] = [dict(item) for item in self.progress_history]
+        return d
 
     @classmethod
     def from_dict(cls, data: dict) -> "TaskRecord":
@@ -84,6 +150,16 @@ class TaskRecord:
             current_run_id=str(data.get("current_run_id", "")),
             run_ids=list(data.get("run_ids", [])),
             last_run_summary=str(data.get("last_run_summary", "")),
+            baseline=dict(data["baseline"]) if data.get("baseline") else None,
+            last_verdict=dict(data["last_verdict"]) if data.get("last_verdict") else None,
+            completion_reason=str(data["completion_reason"]) if data.get("completion_reason") else None,
+            contract_hash=str(data.get("contract_hash", "")),
+            phase=str(data.get("phase", "")),
+            cycle=int(data.get("cycle", 0)),
+            max_cycles=int(data.get("max_cycles", 4)),
+            policy=dict(data["policy"]) if data.get("policy") else None,
+            replan_already_done=bool(data.get("replan_already_done", False)),
+            progress_history=[dict(item) for item in data.get("progress_history", []) if isinstance(item, dict)],
         )
 
 
@@ -98,6 +174,7 @@ class AttemptRecord:
     finished_at: str = ""
     outcome: str = "unknown"
     summary: str = ""
+    tool_steps: int = 0
     artifact_refs: list[str] = field(default_factory=list)
 
     def to_dict(self) -> dict:
@@ -109,6 +186,7 @@ class AttemptRecord:
             "finished_at": self.finished_at,
             "outcome": self.outcome,
             "summary": self.summary,
+            "tool_steps": self.tool_steps,
             "artifact_refs": list(self.artifact_refs),
         }
 
@@ -122,6 +200,7 @@ class AttemptRecord:
             finished_at=str(data.get("finished_at", "")),
             outcome=str(data.get("outcome", "unknown")),
             summary=str(data.get("summary", "")),
+            tool_steps=int(data.get("tool_steps", 0)),
             artifact_refs=list(data.get("artifact_refs", [])),
         )
 
@@ -188,6 +267,7 @@ class TaskStore:
             task.status = status
             if reason:
                 task.last_run_summary = reason
+            task.completion_reason = "human_closed" if status == TaskStatus.COMPLETED else "human_failed"
             self._touch_and_write_unlocked(task)
             return task
 
@@ -232,16 +312,23 @@ class TaskStore:
                     outcome="running",
                 ))
                 self._write_attempts_unlocked(task_id, attempts)
+
+            # 记录 Run 开始前的 task.json 内容哈希，用于结束后完整性校验
+            self._set_run_guard(task_id, run_id)
             return task
 
-    def record_run_finished(self, task_id: str, run_id: str, outcome: str = "completed", summary: str = "", artifact_refs: list[str] | None = None) -> TaskRecord:
-        """完成 Run；同一 run_id 重复提交不会覆盖已落盘结果。"""
+    def record_run_finished(self, task_id: str, run_id: str, outcome: str = "completed",
+                            summary: str = "", tool_steps: int = 0,
+                            artifact_refs: list[str] | None = None) -> TaskRecord:
+        """完成 Run；同一 run_id 重复提交不会覆盖已落盘结果。
+
+        完成后清空 current_run_id，防止 recover_active_run() 误恢复。
+        """
         with self._task_lock(task_id):
             task = self._load_task_unlocked(task_id)
             attempts = self._read_attempts_unlocked(task_id)
             attempt = next((item for item in attempts if item.run_id == run_id), None)
             if attempt is None:
-                # 恢复 task.json 已关联、attempt 写入前崩溃的极小窗口。
                 if run_id not in task.run_ids:
                     raise KeyError(f"run not associated with task: {run_id}")
                 attempt = AttemptRecord(sequence=len(attempts) + 1, run_id=run_id, started_at=_now())
@@ -251,10 +338,19 @@ class TaskStore:
             attempt.finished_at = _now()
             attempt.outcome = outcome
             attempt.summary = summary
+            attempt.tool_steps = tool_steps
             if artifact_refs:
                 attempt.artifact_refs = list(artifact_refs)
             self._write_attempts_unlocked(task_id, attempts)
             task.last_run_summary = summary
+
+            # 在修改 task.json 之前校验 Run 完整性。
+            if run_id and not self.verify_run_integrity(task_id, run_id):
+                task.completion_reason = "integrity_violation"
+                task.status = TaskStatus.FAILED
+
+            # 无论结果如何都结束 attempt；FAILED 任务也不能残留 active run。
+            task.current_run_id = ""
             self._touch_and_write_unlocked(task)
             return task
 
@@ -271,12 +367,42 @@ class TaskStore:
             if active:
                 return active
             # task.json 先落盘、attempt 尚未写入就崩溃时仍可定位 Run。
+            # 注意：仅当 current_run_id 非空且对应 attempt 确实不存在时才返回。
             if task.current_run_id and task.current_run_id in task.run_ids:
-                return AttemptRecord(sequence=len(task.run_ids), run_id=task.current_run_id, outcome="running")
+                attempts = self._read_attempts_unlocked(task_id)
+                if not any(a.run_id == task.current_run_id and not a.finished_at for a in attempts):
+                    return AttemptRecord(sequence=len(task.run_ids), run_id=task.current_run_id, outcome="running")
             return None
 
     def _active_attempt_unlocked(self, task_id: str) -> AttemptRecord | None:
         return next((item for item in reversed(self._read_attempts_unlocked(task_id)) if not item.finished_at), None)
+
+    # -- Run 完整性校验：检测 Run 期间 task.json 是否被外部篡改 -------
+
+    def _set_run_guard(self, task_id: str, run_id: str) -> None:
+        """记录 Run 开始时 task.json 的 checksum，用于结束后校验。"""
+        guard_dir = self._task_dir(task_id) / ".guards"
+        guard_dir.mkdir(parents=True, exist_ok=True)
+        guard_path = guard_dir / f"{run_id}.sha256"
+        try:
+            task_bytes = self._task_path(task_id).read_bytes()
+            guard_path.write_text(hashlib.sha256(task_bytes).hexdigest(), encoding="utf-8")
+        except OSError:
+            pass
+
+    def verify_run_integrity(self, task_id: str, run_id: str) -> bool:
+        """检查 Run 期间 task.json 是否被非 Runtime 写入修改。"""
+        guard_dir = self._task_dir(task_id) / ".guards"
+        guard_path = guard_dir / f"{run_id}.sha256"
+        if not guard_path.exists():
+            return True  # 无 guard 文件时默认通过
+        try:
+            expected = guard_path.read_text(encoding="utf-8").strip()
+            actual = hashlib.sha256(self._task_path(task_id).read_bytes()).hexdigest()
+            guard_path.unlink(missing_ok=True)
+            return expected == actual
+        except OSError:
+            return True
 
     def _task_path(self, task_id: str) -> Path:
         return self._task_dir(task_id) / "task.json"

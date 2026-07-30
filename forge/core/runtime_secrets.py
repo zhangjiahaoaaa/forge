@@ -2,8 +2,24 @@
 
 import os
 
-SENSITIVE_ENV_NAME_MARKERS = ("API_KEY", "TOKEN", "SECRET", "PASSWORD")
+SENSITIVE_ENV_NAME_MARKERS = (
+    "API_KEY", "TOKEN", "SECRET", "PASSWORD", "PAT", "CREDENTIAL",
+)
 REDACTED_VALUE = "<redacted>"
+
+
+def secret_env_values(env=None):
+    """返回按长度排序的敏感环境变量值，供 artifact 脱敏复用。"""
+    env = env or os.environ
+    configured = set()
+    for name in ("FORGE_SECRET_ENV_NAMES", "PICO_SECRET_ENV_NAMES"):
+        configured.update(item.strip().upper() for item in env.get(name, "").split(",") if item.strip())
+    values = []
+    for name, value in env.items():
+        upper = str(name).upper()
+        if value and (upper in configured or any(upper == marker or upper.endswith(marker) or upper.endswith(f"_{marker}") for marker in SENSITIVE_ENV_NAME_MARKERS)):
+            values.append(str(value))
+    return sorted(set(values), key=len, reverse=True)
 
 
 class RuntimeSecretsMixin:

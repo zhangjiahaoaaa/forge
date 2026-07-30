@@ -1,3 +1,4 @@
+import base64
 import json
 
 from forge.testing import ScriptedModelClient
@@ -57,6 +58,83 @@ def test_permission_checker_is_the_single_default_tool_gate(tmp_path):
         and event["reason"] == "approval_denied"
         for event in read_session_events(agent)
     )
+
+
+def test_agent_tools_cannot_modify_durable_task_contract(tmp_path):
+    contract_path = tmp_path / ".forge" / "tasks" / "task_001" / "contract.json"
+    contract_path.parent.mkdir(parents=True)
+    contract_path.write_text('{"goal": "fixed"}\n', encoding="utf-8")
+    agent = build_agent(tmp_path, approval_policy="auto")
+
+    write_result = agent.run_tool(
+        "write_file", {"path": ".forge/tasks/task_001/contract.json", "content": "{}\n"}
+    )
+    patch_result = agent.run_tool(
+        "patch_file",
+        {
+            "path": ".forge/tasks/task_001/contract.json",
+            "old_text": '"fixed"',
+            "new_text": '"tampered"',
+        },
+    )
+
+    evidence_result = agent.run_tool(
+        "write_file", {"path": ".forge/tasks/task_001/evidence/fake.txt", "content": "fake\n"}
+    )
+
+    assert "runtime-managed" in write_result
+    assert "runtime-managed" in patch_result
+    assert "runtime-managed" in evidence_result
+    assert contract_path.read_text(encoding="utf-8") == '{"goal": "fixed"}\n'
+
+
+def test_run_shell_rolls_back_encoded_write_to_durable_task_state(tmp_path):
+    contract_path = tmp_path / ".forge" / "tasks" / "task_001" / "contract.json"
+    contract_path.parent.mkdir(parents=True)
+    original = '{"goal": "fixed"}\n'
+    contract_path.write_text(original, encoding="utf-8")
+    agent = build_agent(tmp_path, approval_policy="auto")
+    payload = base64.b64encode(
+        f"from pathlib import Path; Path({str(contract_path)!r}).write_text('tampered')".encode()
+    ).decode("ascii")
+    command = (
+        "python -c \"import base64; exec(base64.b64decode('"
+        + payload
+        + "'))\""
+    )
+
+    result = agent.run_tool("run_shell", {"command": command, "timeout": 20})
+
+    assert "changes were rolled back" in result
+    assert contract_path.read_text(encoding="utf-8") == original
+    assert agent._last_tool_result_metadata["tool_error_code"] == "protected_task_state_modified"
+    assert any(event["event"] == "protected_task_state_violation" for event in read_session_events(agent))
+
+
+def test_run_shell_rolls_back_new_durable_task_file(tmp_path):
+    task_dir = tmp_path / ".forge" / "tasks" / "task_001"
+    task_dir.mkdir(parents=True)
+    agent = build_agent(tmp_path, approval_policy="auto")
+
+    result = agent.run_tool(
+        "run_shell",
+        {
+            "command": f"python -c \"from pathlib import Path; p=Path({str(tmp_path)!r})/('.for'+'ge')/'tasks'/'task_001'/'evil.txt'; p.write_text('x')\"",
+            "timeout": 20,
+        },
+    )
+
+    assert "changes were rolled back" in result
+    assert not (task_dir / "evil.txt").exists()
+
+
+def test_run_shell_normal_workspace_command_still_works(tmp_path):
+    agent = build_agent(tmp_path, approval_policy="auto")
+
+    result = agent.run_tool("run_shell", {"command": "echo ok", "timeout": 20})
+
+    assert "exit_code: 0" in result
+    assert "ok" in result
 
 
 def test_run_shell_required_sandbox_fails_closed_after_permission(tmp_path):

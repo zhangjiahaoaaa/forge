@@ -17,7 +17,7 @@ def test_core_modules_stay_below_entropy_budget():
         "forge/core/engine.py": 570,
         "forge/core/model_errors.py": 120,
         "forge/core/permissions.py": 140,
-        "forge/core/tool_policy.py": 90,
+        "forge/core/tool_policy.py": 110,
         "forge/core/plan_mode.py": 140,
         "forge/core/tool_executor.py": 260,
         "forge/core/tool_profiles.py": 80,

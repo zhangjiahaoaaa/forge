@@ -1,5 +1,7 @@
 """PR 1 Durable Task Layer 的确定性测试。"""
 
+import json
+
 from forge.core.run_result import RunResult
 from forge.features.task_record import AttemptRecord, TaskRecord, TaskStatus, TaskStore
 
@@ -124,6 +126,22 @@ def test_record_run_finished_idempotent(tmp_path):
     assert len(store.list_attempts(task.task_id)) == 1
 
 
+def test_integrity_failure_closes_current_run(tmp_path):
+    store = TaskStore(tmp_path)
+    task = store.create_task("tampered")
+    store.record_run_started(task.task_id, "run_101")
+    task_path = tmp_path / "tasks" / task.task_id / "task.json"
+    tampered = json.loads(task_path.read_text(encoding="utf-8"))
+    tampered["goal"] = "tampered"
+    task_path.write_text(json.dumps(tampered), encoding="utf-8")
+
+    updated = store.record_run_finished(task.task_id, "run_101", outcome="failed")
+
+    assert updated.status == TaskStatus.FAILED
+    assert updated.current_run_id == ""
+    assert store.recover_active_run(task.task_id) is None
+
+
 def test_multiple_runs_per_task(tmp_path):
     store = TaskStore(tmp_path)
     task = store.create_task("multi run")
@@ -138,13 +156,14 @@ def test_multiple_runs_per_task(tmp_path):
 
 
 def test_attempt_record_roundtrip():
-    original = AttemptRecord(sequence=1, run_id="run_1", legacy_engine_task_id="legacy_1", started_at="2026-01-01T00:00:00", finished_at="2026-01-01T01:00:00", outcome="completed", summary="fixed", artifact_refs=["runs/run_1/report.json"])
+    original = AttemptRecord(sequence=1, run_id="run_1", legacy_engine_task_id="legacy_1", started_at="2026-01-01T00:00:00", finished_at="2026-01-01T01:00:00", outcome="completed", summary="fixed", tool_steps=3, artifact_refs=["runs/run_1/report.json"])
     restored = AttemptRecord.from_dict(original.to_dict())
     assert restored.sequence == 1
     assert restored.run_id == "run_1"
     assert restored.legacy_engine_task_id == "legacy_1"
     assert restored.outcome == "completed"
     assert restored.summary == "fixed"
+    assert restored.tool_steps == 3
     assert restored.artifact_refs == ["runs/run_1/report.json"]
 
 
