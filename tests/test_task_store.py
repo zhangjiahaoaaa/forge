@@ -7,6 +7,12 @@ from forge.core.run_result import RunResult
 from forge.features.task_record import AttemptRecord, TaskRecord, TaskStatus, TaskStore
 
 
+def _attempt_token(store, task_id: str, run_id: str) -> str:
+    """读取 attempt 的 fencing token（测试 helper）。"""
+    attempt = next((a for a in store.list_attempts(task_id) if a.run_id == run_id), None)
+    return str(getattr(attempt, "owner_token", "") or "") if attempt else ""
+
+
 def test_task_record_creates_with_expected_defaults():
     record = TaskRecord(task_id="t1", goal="fix bug")
     assert record.task_id == "t1"
@@ -111,7 +117,10 @@ def test_record_run_finished(tmp_path):
     store = TaskStore(tmp_path)
     task = store.create_task("test run")
     store.record_run_started(task.task_id, "run_101", "legacy_1")
-    updated = store.record_run_finished(task.task_id, "run_101", outcome="completed", summary="fix applied")
+    updated = store.record_run_finished(
+        task.task_id, "run_101", outcome="completed", summary="fix applied",
+        owner_token=_attempt_token(store, task.task_id, "run_101"),
+    )
     assert updated.last_run_summary == "fix applied"
     attempt = store.list_attempts(task.task_id)[0]
     assert attempt.outcome == "completed"
@@ -122,8 +131,9 @@ def test_record_run_finished_idempotent(tmp_path):
     store = TaskStore(tmp_path)
     task = store.create_task("test")
     store.record_run_started(task.task_id, "run_101")
-    store.record_run_finished(task.task_id, "run_101", summary="done")
-    store.record_run_finished(task.task_id, "run_101", summary="done")
+    token = _attempt_token(store, task.task_id, "run_101")
+    store.record_run_finished(task.task_id, "run_101", summary="done", owner_token=token)
+    store.record_run_finished(task.task_id, "run_101", summary="done", owner_token=token)
     assert len(store.list_attempts(task.task_id)) == 1
 
 
@@ -136,7 +146,10 @@ def test_integrity_failure_closes_current_run(tmp_path):
     tampered["goal"] = "tampered"
     task_path.write_text(json.dumps(tampered), encoding="utf-8")
 
-    updated = store.record_run_finished(task.task_id, "run_101", outcome="failed")
+    updated = store.record_run_finished(
+        task.task_id, "run_101", outcome="failed",
+        owner_token=_attempt_token(store, task.task_id, "run_101"),
+    )
 
     assert updated.status == TaskStatus.FAILED
     assert updated.current_run_id == ""
@@ -149,7 +162,8 @@ def test_multiple_runs_per_task(tmp_path):
     for i in range(3):
         run_id = f"run_{i + 1}"
         store.record_run_started(task.task_id, run_id)
-        store.record_run_finished(task.task_id, run_id)
+        store.record_run_finished(task.task_id, run_id,
+                                  owner_token=_attempt_token(store, task.task_id, run_id))
     loaded = store.load_task(task.task_id)
     assert len(loaded.run_ids) == 3
     attempts = store.list_attempts(task.task_id)
@@ -197,7 +211,8 @@ def test_task_survives_directory_reload(tmp_path):
     store1 = TaskStore(tmp_path)
     task = store1.create_task("persist test")
     store1.record_run_started(task.task_id, "run_1")
-    store1.record_run_finished(task.task_id, "run_1", summary="done")
+    store1.record_run_finished(task.task_id, "run_1", summary="done",
+                               owner_token=_attempt_token(store1, task.task_id, "run_1"))
     store2 = TaskStore(tmp_path)
     assert store2.load_task(task.task_id).goal == "persist test"
     assert store2.list_attempts(task.task_id)[0].outcome == "completed"
@@ -385,11 +400,11 @@ def test_record_run_started_rejects_live_owner_reentry(tmp_path):
 
 def test_claim_active_run_updates_owner_atomically(tmp_path):
     """claim_active_run：旧 owner 失效才允许认领；旧 owner 存活时拒绝。"""
-    import os
-
     store = TaskStore(tmp_path)
     task = store.create_task("claim")
     store.record_run_started(task.task_id, "run_1")
+    old_token = _attempt_token(store, task.task_id, "run_1")
+    assert old_token, "record_run_started must issue a fencing token"
     # 模拟崩溃 owner（死 PID）→ 可认领
     attempts = store.list_attempts(task.task_id)
     attempts[0].owner_pid = 99999999
@@ -400,6 +415,8 @@ def test_claim_active_run_updates_owner_atomically(tmp_path):
                                      owner_started_at="2026-01-01T00:00:00+00:00")
     assert claimed.owner_pid == os.getpid()
     assert claimed.owner_started_at == "2026-01-01T00:00:00+00:00"
+    # 认领签发新 token：旧 token 不再有效
+    assert claimed.owner_token and claimed.owner_token != old_token
 
     # owner 存活（当前进程）→ 拒绝认领
     task2 = store.create_task("claim2")
@@ -409,6 +426,44 @@ def test_claim_active_run_updates_owner_atomically(tmp_path):
         assert False, "expected live-owner rejection"
     except ValueError as exc:
         assert "live process" in str(exc), str(exc)
+
+
+def test_claim_active_run_overwrites_empty_started_at(tmp_path):
+    """认领时获取不到创建时间（空值）也必须覆盖旧时间戳，防止新旧不匹配判死。"""
+    store = TaskStore(tmp_path)
+    task = store.create_task("claim empty ts")
+    store.record_run_started(task.task_id, "run_1")
+    attempts = store.list_attempts(task.task_id)
+    attempts[0].owner_pid = 99999999  # 模拟崩溃 owner
+    attempts[0].owner_started_at = "2020-01-01T00:00:00+00:00"  # 旧 owner 的时间戳
+    store._write_attempts_unlocked(task.task_id, attempts)
+    claimed = store.claim_active_run(task.task_id, "run_1",
+                                     owner_pid=os.getpid(), owner_started_at="")
+    assert claimed.owner_pid == os.getpid()
+    assert claimed.owner_started_at == "", \
+        f"empty started_at must overwrite stale value, got {claimed.owner_started_at}"
+
+
+def test_record_run_started_never_forges_started_at(tmp_path):
+    """process_started_at 获取失败时保持空字符串，绝不用 _now() 伪造。"""
+    from unittest import mock
+
+    with mock.patch("forge.features.task_record.process_started_at", return_value=""):
+        store = TaskStore(tmp_path)
+        task = store.create_task("no forged ts")
+        store.record_run_started(task.task_id, "run_1")
+        attempt = store.list_attempts(task.task_id)[0]
+        assert attempt.owner_started_at == "", \
+            f"must stay empty, got {attempt.owner_started_at!r}"
+        # 活跃 owner（当前进程）在空时间戳下仍被判定存活：
+        # pid_alive 只看存活状态（fail-closed），且 claim 必须被拒绝
+        from forge.core.process import pid_alive
+        assert pid_alive(os.getpid(), "") is True
+        try:
+            store.claim_active_run(task.task_id, "run_1", owner_pid=99999999)
+            assert False, "expected live-owner rejection with empty started_at"
+        except ValueError as exc:
+            assert "live process" in str(exc), str(exc)
 
 
 # ---------------------------------------------------------------------------

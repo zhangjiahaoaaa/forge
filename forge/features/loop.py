@@ -728,8 +728,22 @@ class LoopController:
             run_id = task.current_run_id
             if run_id in task.run_ids:
                 try:
+                    # 异常收尾也要持 token（与正常收尾一致），否则新 Run 的
+                    # fencing 校验会误把异常路径导到 run_interrupted。
+                    exc_token = ""
+                    try:
+                        exc_attempt = next(
+                            (a for a in self.task_store.list_attempts(task.task_id)
+                             if a.run_id == run_id),
+                            None,
+                        )
+                        if exc_attempt is not None:
+                            exc_token = str(getattr(exc_attempt, "owner_token", "") or "")
+                    except Exception:
+                        pass
                     self.task_store.record_run_finished(
-                        task.task_id, run_id, outcome="failed", summary=f"run_error: {exc}"
+                        task.task_id, run_id, outcome="failed",
+                        summary=f"run_error: {exc}", owner_token=exc_token,
                     )
                 except Exception as finish_exc:
                     task = self.task_store.load_task(task.task_id)
@@ -782,6 +796,7 @@ class LoopController:
 
         # 中断前已消耗的 tool_steps 结转进本次 Run，避免恢复后绕过总预算。
         carry_steps = 0
+        owner_token = ""
         if is_resume:
             try:
                 interrupted = next(
@@ -790,8 +805,22 @@ class LoopController:
                 )
                 if interrupted is not None:
                     carry_steps = int(getattr(interrupted, "tool_steps", 0) or 0)
+                    owner_token = str(getattr(interrupted, "owner_token", "") or "")
             except Exception:
                 carry_steps = 0
+
+        # fencing token：收尾写入必须持有当前认领者的 token。
+        # 新 Run 场景 token 由 record_run_started 生成；resume 场景由 claim 签发。
+        if not owner_token:
+            try:
+                attempt = next(
+                    (a for a in self.task_store.list_attempts(task.task_id) if a.run_id == run_id),
+                    None,
+                )
+                if attempt is not None:
+                    owner_token = str(getattr(attempt, "owner_token", "") or "")
+            except Exception:
+                pass
 
         self.task_store.record_run_finished(task.task_id, run_id, outcome=result.outcome,
                                              summary=(result.final_answer or "")[:200],
@@ -799,7 +828,8 @@ class LoopController:
                                              artifact_refs=artifact_refs,
                                              session_id=session_id,
                                              checkpoint_ref=checkpoint_ref,
-                                             runtime_identity=runtime_identity)
+                                             runtime_identity=runtime_identity,
+                                             owner_token=owner_token)
 
         # 重载 task 避免 stale revision；Run 结束后再次检查预算，避免超额进入 verify。
         task = self.task_store.load_task(task.task_id)
@@ -1009,14 +1039,14 @@ class LoopController:
         return True, "valid"
 
     def _session_load(self, session_id: str) -> dict | None:
-        """加载 session 文件；不存在 / 损坏 / id 不一致返回 None。"""
+        """加载 session 文件；不存在 / 损坏 / id 不一致（含空 id）返回 None。"""
         try:
             ws_root = self.verification_service.workspace_root
             store = SessionStore(workspace_state_path(ws_root, "sessions"))
             session = store.load(session_id)
             if not isinstance(session, dict):
                 return None
-            if session.get("id") and session["id"] != session_id:
+            if session.get("id") != session_id:
                 return None
             return session
         except Exception:
@@ -1081,11 +1111,12 @@ class LoopController:
                     pass
             valid, reason = self._checkpoint_valid(task, interrupted)
             if valid and self._build_resume_agent is not None:
-                # 原子认领：把 owner 更新为当前恢复进程。
+                # 原子认领：把 owner 更新为当前恢复进程，并签发新的 fencing token。
                 # 这是 recover → resume 的所有权协议——认领后其他 recover()
-                # 会看到 owner 存活而返回 in_progress，不会再接管同一 Run。
+                # 会看到 owner 存活而返回 in_progress，不会再接管同一 Run；
+                # 旧执行者的延迟写入也会因 token 不匹配而被拒绝。
                 try:
-                    self.task_store.claim_active_run(
+                    claimed = self.task_store.claim_active_run(
                         task.task_id,
                         interrupted.run_id,
                         owner_pid=os.getpid(),
@@ -1108,6 +1139,7 @@ class LoopController:
                     "session_id": interrupted.session_id,
                     "checkpoint_ref": interrupted.checkpoint_ref,
                     "cycle": getattr(task, "cycle", 0),
+                    "owner_token": str(getattr(claimed, "owner_token", "") or ""),
                 }
                 task.last_resume_attempt = {
                     "attempted_at": _now(),

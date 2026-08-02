@@ -5,6 +5,7 @@ All deterministic — no live provider needed.
 """
 
 import json
+import os
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -21,6 +22,12 @@ from forge.features.loop import (
 )
 from forge.features.task_record import TaskRecord, TaskPhase, TaskStatus, TaskStore
 from forge.features.verification import ContractStore, TaskVerificationService
+
+
+def _attempt_token(store, task_id: str, run_id: str) -> str:
+    """读取 attempt 的 fencing token（测试 helper）。"""
+    attempt = next((a for a in store.list_attempts(task_id) if a.run_id == run_id), None)
+    return str(getattr(attempt, "owner_token", "") or "") if attempt else ""
 
 
 # ---------------------------------------------------------------------------
@@ -147,7 +154,8 @@ def test_assess_uses_latest_cycle_tool_count(tmp_path):
     task.replan_already_done = True
     store.save_task(task)
     store.record_run_started(task.task_id, "run_1")
-    store.record_run_finished(task.task_id, "run_1", tool_steps=1)
+    store.record_run_finished(task.task_id, "run_1", tool_steps=1,
+                              owner_token=_attempt_token(store, task.task_id, "run_1"))
 
     ctrl = LoopController(
         store, ContractStore(tmp_path / "tasks"),
@@ -160,7 +168,8 @@ def test_assess_uses_latest_cycle_tool_count(tmp_path):
     saved.phase = "assessing_progress"
     store.save_task(saved)
     store.record_run_started(task.task_id, "run_2")
-    store.record_run_finished(task.task_id, "run_2", tool_steps=1)
+    store.record_run_finished(task.task_id, "run_2", tool_steps=1,
+                              owner_token=_attempt_token(store, task.task_id, "run_2"))
 
     second = ctrl.advance(task.task_id)
     assert second["action"] == "waiting_human"
@@ -783,6 +792,79 @@ def test_resume_missing_tool_signature_fails_closed(tmp_path):
     assert saved.cycle == 2
 
 
+def test_resume_invalid_when_session_id_empty(tmp_path):
+    """session 文件存在但 id 为空 → checkpoint 无效，降级新 Run。"""
+    store = TaskStore(tmp_path)
+    task = _make_task(store, phase="run_interrupted", status="in_progress", cycle=1)
+    task.contract_hash = "frozen"
+    store.save_task(task)
+    sess_dir = tmp_path / ".forge" / "sessions"
+    sess_dir.mkdir(parents=True, exist_ok=True)
+    (sess_dir / "session_e.json").write_text(
+        json.dumps({"id": "", "history": [],
+                    "checkpoints": {"current_id": "", "items": {}}}),
+        encoding="utf-8",
+    )
+    store.record_run_started(task.task_id, "run_e", "legacy_e")
+    attempts = store.list_attempts(task.task_id)
+    attempts[0].session_id = "session_e"
+    attempts[0].runtime_identity = {"model": "scripted", "tool_signature": "test-sig"}
+    attempts[0].owner_pid = 0
+    store._write_attempts_unlocked(task.task_id, attempts)
+
+    cs = ContractStore(tmp_path / "tasks")
+    vs = TaskVerificationService(store, cs, tmp_path, tmp_path / "tasks")
+    ctrl = LoopController(store, cs, vs, build_agent_fn=_ResumeRecordingAgent,
+                          build_resume_agent_fn=lambda sid: _ResumeRecordingAgent())
+    r = ctrl.recover(task.task_id)
+    assert r.get("action") == "resumed", f"got {r.get('action')}"  # 降级：关闭旧 run
+    assert store.load_task(task.task_id).resume_ref is None
+
+
+def test_record_run_finished_rejects_stale_owner_token(tmp_path):
+    """fencing：attempt 被重新认领后，旧 token 的收尾写入被拒绝。"""
+    store = TaskStore(tmp_path)
+    task = store.create_task("fencing")
+    store.record_run_started(task.task_id, "run_1")
+    stale_token = _attempt_token(store, task.task_id, "run_1")
+    # 重新认领（模拟另一个恢复者接管）
+    attempts = store.list_attempts(task.task_id)
+    attempts[0].owner_pid = 99999999
+    store._write_attempts_unlocked(task.task_id, attempts)
+    store.claim_active_run(task.task_id, "run_1", owner_pid=os.getpid())
+    new_token = _attempt_token(store, task.task_id, "run_1")
+    assert new_token and new_token != stale_token
+    # 旧 token 收尾 → 拒绝
+    try:
+        store.record_run_finished(task.task_id, "run_1", outcome="completed",
+                                  owner_token=stale_token)
+        assert False, "expected stale token rejection"
+    except ValueError as exc:
+        assert "token mismatch" in str(exc), str(exc)
+    # 新 token 收尾 → 成功
+    store.record_run_finished(task.task_id, "run_1", outcome="completed",
+                              owner_token=new_token)
+    assert store.list_attempts(task.task_id)[0].outcome == "completed"
+
+
+def test_resume_uses_claimed_token_for_finish(tmp_path):
+    """resume 恢复完成后，收尾写入使用认领签发的新 token。"""
+    store = TaskStore(tmp_path)
+    task = _make_resumable_task(store, tmp_path, valid=True)
+    cs = ContractStore(tmp_path / "tasks")
+    vs = TaskVerificationService(store, cs, tmp_path, tmp_path / "tasks")
+    resume_agent = _ResumeRecordingAgent()
+    ctrl = LoopController(store, cs, vs, build_agent_fn=lambda: _ResumeRecordingAgent(),
+                          build_resume_agent_fn=lambda sid: resume_agent)
+    r1 = ctrl.advance(task.task_id)
+    assert r1.get("action") == "resume_ready", f"got {r1.get('action')}"
+    ctrl.advance(task.task_id)  # resume run 完成 → record_run_finished(token)
+    attempts = store.list_attempts(task.task_id)
+    assert attempts[-1].outcome == "completed", \
+        f"resume finish must succeed with claimed token: {attempts[-1].outcome}"
+    assert attempts[-1].owner_token, "attempt must carry fencing token"
+
+
 def test_recover_does_not_steal_live_run(tmp_path):
     """并发 recover() 不得接管 owner 进程仍存活的 Run（fail closed）。"""
     import subprocess
@@ -1047,7 +1129,8 @@ def test_assess_uses_current_workspace_diff_fingerprint(tmp_path):
     store.save_task(task)
 
     store.record_run_started(task.task_id, "run_1")
-    store.record_run_finished(task.task_id, "run_1", tool_steps=1)
+    store.record_run_finished(task.task_id, "run_1", tool_steps=1,
+                              owner_token=_attempt_token(store, task.task_id, "run_1"))
     first = LoopController(store, cs, vs).advance(task.task_id)
     assert first["action"] == "continue"
     first_fp = store.load_task(task.task_id).progress_history[-1]["diff_fingerprint"]
@@ -1058,7 +1141,8 @@ def test_assess_uses_current_workspace_diff_fingerprint(tmp_path):
     store.save_task(saved)
     source.write_text("def add(a, b):\n    return a * b\n", encoding="utf-8")
     store.record_run_started(task.task_id, "run_2")
-    store.record_run_finished(task.task_id, "run_2", tool_steps=1)
+    store.record_run_finished(task.task_id, "run_2", tool_steps=1,
+                              owner_token=_attempt_token(store, task.task_id, "run_2"))
     second = LoopController(store, cs, vs).advance(task.task_id)
 
     second_fp = second["task"].progress_history[-1]["diff_fingerprint"]

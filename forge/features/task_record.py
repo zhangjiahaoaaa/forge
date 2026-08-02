@@ -202,7 +202,11 @@ class AttemptRecord:
     """启动该 Run 的进程 PID。recover() 据此判断进程是否仍存活，避免
     并发 recover 误杀正在执行的 Run。"""
     owner_started_at: str = ""
-    """启动该 Run 的进程启动时间（ISO）。配合 owner_pid 降低 PID 复用误判。"""
+    """启动该 Run 的进程创建时间（UTC ISO）。配合 owner_pid 排除 PID 复用误判。
+    获取不到真实创建时间时保持空字符串（绝不伪造）。"""
+    owner_token: str = ""
+    """fencing token：每次认领（claim）重新生成。收尾写入（record_run_finished）
+    必须持有匹配 token，否则拒绝——防止旧执行者延迟写入已被重新认领的 Run。"""
 
     def to_dict(self) -> dict:
         d = {
@@ -226,6 +230,8 @@ class AttemptRecord:
             d["owner_pid"] = int(self.owner_pid)
         if self.owner_started_at:
             d["owner_started_at"] = self.owner_started_at
+        if self.owner_token:
+            d["owner_token"] = self.owner_token
         return d
 
     @classmethod
@@ -245,6 +251,7 @@ class AttemptRecord:
             runtime_identity=dict(data["runtime_identity"]) if data.get("runtime_identity") else None,
             owner_pid=int(data.get("owner_pid", 0) or 0),
             owner_started_at=str(data.get("owner_started_at", "")),
+            owner_token=str(data.get("owner_token", "")),
         )
 
 
@@ -343,9 +350,11 @@ class TaskStore:
                         f"run owned by live process (pid {old_pid}); "
                         f"claim_active_run() required before resume"
                     )
-                # 原 owner 已失效 → 重入即认领：更新 owner 为当前进程
+                # 原 owner 已失效 → 重入即认领：更新 owner 为当前进程。
+                # 注意：获取不到真实创建时间时保持空字符串，绝不用 _now() 伪造——
+                # 伪造的时间戳与真实创建时间必然不同，pid_alive 会把活 owner 判死。
                 existing.owner_pid = os.getpid()
-                existing.owner_started_at = process_started_at(os.getpid()) or _now()
+                existing.owner_started_at = process_started_at(os.getpid())
                 self._write_attempts_unlocked(task_id, attempts)
 
             # 先写 task.json：该文件是崩溃恢复的权威入口。若进程在随后
@@ -371,7 +380,8 @@ class TaskStore:
                     started_at=_now(),
                     outcome="running",
                     owner_pid=os.getpid(),
-                    owner_started_at=process_started_at(os.getpid()) or _now(),
+                    owner_started_at=process_started_at(os.getpid()),
+                    owner_token=uuid.uuid4().hex,
                 ))
                 self._write_attempts_unlocked(task_id, attempts)
 
@@ -425,9 +435,13 @@ class TaskStore:
             if (old_pid and old_pid != int(owner_pid)
                     and pid_alive(old_pid, getattr(attempt, "owner_started_at", ""))):
                 raise ValueError(f"run still owned by live process (pid {old_pid})")
+            # 无条件写入 owner（含空创建时间）：空值也必须覆盖旧值，
+            # 否则 owner_pid 已换新但 owner_started_at 仍是旧进程的时间戳，
+            # 后续检查会把新 owner 判死（创建时间必然不同）而被接管。
             attempt.owner_pid = int(owner_pid)
-            if owner_started_at:
-                attempt.owner_started_at = owner_started_at
+            attempt.owner_started_at = owner_started_at
+            # 重新认领 = 新的 fencing token：旧执行者的延迟写入会被拒绝
+            attempt.owner_token = uuid.uuid4().hex
             self._write_attempts_unlocked(task_id, attempts)
             return attempt
 
@@ -435,8 +449,13 @@ class TaskStore:
                             summary: str = "", tool_steps: int = 0,
                             artifact_refs: list[str] | None = None,
                             session_id: str = "", checkpoint_ref: str = "",
-                            runtime_identity: dict | None = None) -> TaskRecord:
+                            runtime_identity: dict | None = None,
+                            owner_token: str = "") -> TaskRecord:
         """完成 Run；同一 run_id 重复提交不会覆盖已落盘结果。
+
+        ``owner_token`` 是 fencing 校验：attempt 已记录 token（被认领过）时，
+        调用方必须持有匹配 token，否则拒绝写入——防止旧执行者延迟完成
+        覆盖已被重新认领的 Run。
 
         完成后清空 current_run_id，防止 recover_active_run() 误恢复。
         """
@@ -451,6 +470,12 @@ class TaskStore:
                 attempts.append(attempt)
             if attempt.finished_at:
                 return task
+            token = str(getattr(attempt, "owner_token", "") or "")
+            if token and owner_token != token:
+                raise ValueError(
+                    f"ownership token mismatch for run {run_id}: "
+                    f"run has been reclaimed by another owner"
+                )
             attempt.finished_at = _now()
             attempt.outcome = outcome
             attempt.summary = summary

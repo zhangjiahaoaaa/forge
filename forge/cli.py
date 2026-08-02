@@ -862,12 +862,26 @@ def _main_task(task_argv):
         trusted_baseline = dict(task.baseline or {})
         trusted_contract_hash = task.contract_hash
         trusted_goal = task.goal
-        result = agent.ask_run(
-            prompt,
-            on_run_started=lambda run_id, legacy_task_id: store.record_run_started(
+        owner_token_holder: dict[str, str] = {"token": ""}
+
+        def _on_run_started(run_id, legacy_task_id):
+            store.record_run_started(
                 task_id, run_id, legacy_engine_task_id=legacy_task_id
-            ),
-        )
+            )
+            # 读取 fencing token：收尾写入必须持有（record_run_finished 校验）
+            try:
+                attempt = next(
+                    (a for a in store.list_attempts(task_id) if a.run_id == run_id),
+                    None,
+                )
+                if attempt is not None:
+                    owner_token_holder["token"] = str(
+                        getattr(attempt, "owner_token", "") or ""
+                    )
+            except Exception:
+                pass
+
+        result = agent.ask_run(prompt, on_run_started=_on_run_started)
 
         artifact_refs = []
         ts = getattr(agent, "current_task_state", None)
@@ -882,6 +896,7 @@ def _main_task(task_argv):
             outcome=result.outcome,
             summary=(result.final_answer or "")[:200],
             artifact_refs=artifact_refs,
+            owner_token=owner_token_holder["token"],
         )
 
         task = store.load_task(task_id)
