@@ -18,6 +18,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from ..core.process import pid_alive, process_started_at
+
 
 class TaskStatus(str, enum.Enum):
     """Durable Task 的业务状态（PR 1 – PR 3）。"""
@@ -93,6 +95,10 @@ class TaskRecord:
     """是否已执行过一次 REPLAN，重启后仍保留。"""
     progress_history: list[dict] = field(default_factory=list)
     """最近的停滞检测信号，跨 CLI 进程保留。"""
+    resume_ref: dict | None = None
+    """PR 3b：有效 checkpoint 的恢复引用（run_id / session_id / checkpoint_ref / cycle）。"""
+    last_resume_attempt: dict | None = None
+    """PR 3c：最近一次恢复尝试的审计记录（结果 / 原因），跨进程保留。"""
 
     def __post_init__(self):
         if not self.created_at:
@@ -135,6 +141,10 @@ class TaskRecord:
             d["replan_already_done"] = True
         if self.progress_history:
             d["progress_history"] = [dict(item) for item in self.progress_history]
+        if self.resume_ref:
+            d["resume_ref"] = dict(self.resume_ref)
+        if self.last_resume_attempt:
+            d["last_resume_attempt"] = dict(self.last_resume_attempt)
         return d
 
     @classmethod
@@ -160,6 +170,8 @@ class TaskRecord:
             policy=dict(data["policy"]) if data.get("policy") else None,
             replan_already_done=bool(data.get("replan_already_done", False)),
             progress_history=[dict(item) for item in data.get("progress_history", []) if isinstance(item, dict)],
+            resume_ref=dict(data["resume_ref"]) if data.get("resume_ref") else None,
+            last_resume_attempt=dict(data["last_resume_attempt"]) if data.get("last_resume_attempt") else None,
         )
 
 
@@ -177,8 +189,23 @@ class AttemptRecord:
     tool_steps: int = 0
     artifact_refs: list[str] = field(default_factory=list)
 
+    # PR 3a — checkpoint resume 引用
+    session_id: str = ""
+    """该 Run 使用的 Forge session id，用于同一 Run 恢复。"""
+    checkpoint_ref: str = ""
+    """该 Run 最后创建的可恢复 checkpoint id。"""
+    runtime_identity: dict | None = None
+    """运行时身份快照（model / 工具签名 / 工作区指纹），用于恢复前校验。"""
+
+    # PR 3c — Run 所有权（防误接管）
+    owner_pid: int = 0
+    """启动该 Run 的进程 PID。recover() 据此判断进程是否仍存活，避免
+    并发 recover 误杀正在执行的 Run。"""
+    owner_started_at: str = ""
+    """启动该 Run 的进程启动时间（ISO）。配合 owner_pid 降低 PID 复用误判。"""
+
     def to_dict(self) -> dict:
-        return {
+        d = {
             "sequence": self.sequence,
             "run_id": self.run_id,
             "legacy_engine_task_id": self.legacy_engine_task_id,
@@ -189,6 +216,17 @@ class AttemptRecord:
             "tool_steps": self.tool_steps,
             "artifact_refs": list(self.artifact_refs),
         }
+        if self.session_id:
+            d["session_id"] = self.session_id
+        if self.checkpoint_ref:
+            d["checkpoint_ref"] = self.checkpoint_ref
+        if self.runtime_identity:
+            d["runtime_identity"] = dict(self.runtime_identity)
+        if self.owner_pid:
+            d["owner_pid"] = int(self.owner_pid)
+        if self.owner_started_at:
+            d["owner_started_at"] = self.owner_started_at
+        return d
 
     @classmethod
     def from_dict(cls, data: dict) -> "AttemptRecord":
@@ -202,6 +240,11 @@ class AttemptRecord:
             summary=str(data.get("summary", "")),
             tool_steps=int(data.get("tool_steps", 0)),
             artifact_refs=list(data.get("artifact_refs", [])),
+            session_id=str(data.get("session_id", "")),
+            checkpoint_ref=str(data.get("checkpoint_ref", "")),
+            runtime_identity=dict(data["runtime_identity"]) if data.get("runtime_identity") else None,
+            owner_pid=int(data.get("owner_pid", 0) or 0),
+            owner_started_at=str(data.get("owner_started_at", "")),
         )
 
 
@@ -272,7 +315,11 @@ class TaskStore:
             return task
 
     def record_run_started(self, task_id: str, run_id: str, legacy_engine_task_id: str = "") -> TaskRecord:
-        """在 Harness Run 执行前持久化其关联，且同一 run_id 幂等。"""
+        """在 Harness Run 执行前持久化其关联，且同一 run_id 幂等。
+
+        幂等重入受所有权协议约束：attempt 已有活跃 owner（其他存活进程）时
+        拒绝重入——恢复执行必须先通过 ``claim_active_run()`` 认领。
+        """
         if not str(run_id).strip():
             raise ValueError("run_id is required")
         with self._task_lock(task_id):
@@ -287,6 +334,19 @@ class TaskStore:
             existing = next((item for item in attempts if item.run_id == run_id), None)
             if existing and existing.finished_at:
                 raise ValueError(f"run already finished: {run_id}")
+            if existing is not None:
+                # 同 run_id 重入（恢复场景）：校验所有权。
+                old_pid = int(getattr(existing, "owner_pid", 0) or 0)
+                if (old_pid and old_pid != os.getpid()
+                        and pid_alive(old_pid, getattr(existing, "owner_started_at", ""))):
+                    raise ValueError(
+                        f"run owned by live process (pid {old_pid}); "
+                        f"claim_active_run() required before resume"
+                    )
+                # 原 owner 已失效 → 重入即认领：更新 owner 为当前进程
+                existing.owner_pid = os.getpid()
+                existing.owner_started_at = process_started_at(os.getpid()) or _now()
+                self._write_attempts_unlocked(task_id, attempts)
 
             # 先写 task.json：该文件是崩溃恢复的权威入口。若进程在随后
             # 写入 attempts.jsonl 前中断，recover_active_run() 仍能定位此 Run。
@@ -310,6 +370,8 @@ class TaskStore:
                     legacy_engine_task_id=legacy_engine_task_id,
                     started_at=_now(),
                     outcome="running",
+                    owner_pid=os.getpid(),
+                    owner_started_at=process_started_at(os.getpid()) or _now(),
                 ))
                 self._write_attempts_unlocked(task_id, attempts)
 
@@ -317,9 +379,63 @@ class TaskStore:
             self._set_run_guard(task_id, run_id)
             return task
 
+    def update_attempt(self, task_id: str, run_id: str, **fields) -> TaskRecord:
+        """就地更新未结束 attempt 的持久化字段。
+
+        Run 运行中（而非结束时）落盘 session_id / checkpoint_ref /
+        tool_steps / runtime_identity，使进程崩溃后仍可依据这些引用恢复。
+        空值与 None 会被跳过，避免覆盖已有内容。
+        """
+        with self._task_lock(task_id):
+            attempts = self._read_attempts_unlocked(task_id)
+            attempt = next((item for item in attempts if item.run_id == run_id), None)
+            if attempt is None:
+                raise KeyError(f"run not associated with task: {run_id}")
+            changed = False
+            for key, value in fields.items():
+                if value is None:
+                    continue
+                if isinstance(value, str) and not value:
+                    continue
+                if getattr(attempt, key, None) == value:
+                    continue
+                setattr(attempt, key, value)
+                changed = True
+            if changed:
+                self._write_attempts_unlocked(task_id, attempts)
+            return self._load_task_unlocked(task_id)
+
+    def claim_active_run(self, task_id: str, run_id: str,
+                         owner_pid: int, owner_started_at: str = "") -> AttemptRecord:
+        """原子认领一个 active Run：把 owner 更新为恢复者（recover → resume 的所有权协议）。
+
+        仅在旧 owner 已失效（无 owner / owner 进程已死 / owner 就是自己）时允许；
+        旧 owner 仍存活时拒绝——防止两个控制器同时接管同一 Run。
+
+        必须在 Task 锁内完成：检查旧 owner 与写入新 owner 是同一原子操作。
+        """
+        with self._task_lock(task_id):
+            attempts = self._read_attempts_unlocked(task_id)
+            attempt = next((item for item in attempts if item.run_id == run_id), None)
+            if attempt is None:
+                raise KeyError(f"run not associated with task: {run_id}")
+            if attempt.finished_at:
+                raise ValueError(f"run already finished: {run_id}")
+            old_pid = int(getattr(attempt, "owner_pid", 0) or 0)
+            if (old_pid and old_pid != int(owner_pid)
+                    and pid_alive(old_pid, getattr(attempt, "owner_started_at", ""))):
+                raise ValueError(f"run still owned by live process (pid {old_pid})")
+            attempt.owner_pid = int(owner_pid)
+            if owner_started_at:
+                attempt.owner_started_at = owner_started_at
+            self._write_attempts_unlocked(task_id, attempts)
+            return attempt
+
     def record_run_finished(self, task_id: str, run_id: str, outcome: str = "completed",
                             summary: str = "", tool_steps: int = 0,
-                            artifact_refs: list[str] | None = None) -> TaskRecord:
+                            artifact_refs: list[str] | None = None,
+                            session_id: str = "", checkpoint_ref: str = "",
+                            runtime_identity: dict | None = None) -> TaskRecord:
         """完成 Run；同一 run_id 重复提交不会覆盖已落盘结果。
 
         完成后清空 current_run_id，防止 recover_active_run() 误恢复。
@@ -341,6 +457,12 @@ class TaskStore:
             attempt.tool_steps = tool_steps
             if artifact_refs:
                 attempt.artifact_refs = list(artifact_refs)
+            if session_id:
+                attempt.session_id = session_id
+            if checkpoint_ref:
+                attempt.checkpoint_ref = checkpoint_ref
+            if runtime_identity:
+                attempt.runtime_identity = dict(runtime_identity)
             self._write_attempts_unlocked(task_id, attempts)
             task.last_run_summary = summary
 
@@ -352,6 +474,42 @@ class TaskStore:
             # 无论结果如何都结束 attempt；FAILED 任务也不能残留 active run。
             task.current_run_id = ""
             self._touch_and_write_unlocked(task)
+            return task
+
+    def record_run_interrupted(self, task_id: str, run_id: str, summary: str = "",
+                               tool_steps: int = 0, checkpoint_ref: str = "") -> TaskRecord:
+        """结束进程中断遗留的 Run，使下一 Cycle 可安全启动新 Run。
+
+        中断 Run 没有可供验收的完整结果，不能调用 ``record_run_finished()`` 的
+        成功 Run 完整性裁决；这里只关闭 active attempt 并保留中断原因。
+        ``tool_steps`` 记录中断前已消耗的工具步数，防止恢复后绕过总预算；
+        ``checkpoint_ref`` 保留中断时刻的 checkpoint 位置（若有）。
+        """
+        with self._task_lock(task_id):
+            task = self._load_task_unlocked(task_id)
+            attempts = self._read_attempts_unlocked(task_id)
+            attempt = next((item for item in attempts if item.run_id == run_id), None)
+            if attempt is None:
+                if run_id not in task.run_ids:
+                    raise KeyError(f"run not associated with task: {run_id}")
+                attempt = AttemptRecord(sequence=len(attempts) + 1, run_id=run_id, started_at=_now())
+                attempts.append(attempt)
+            if not attempt.finished_at:
+                attempt.finished_at = _now()
+                attempt.outcome = "interrupted"
+                attempt.summary = summary
+                attempt.tool_steps = max(attempt.tool_steps, tool_steps)
+                if checkpoint_ref:
+                    attempt.checkpoint_ref = checkpoint_ref
+                self._write_attempts_unlocked(task_id, attempts)
+            if task.current_run_id == run_id:
+                task.current_run_id = ""
+            task.last_run_summary = summary
+            self._touch_and_write_unlocked(task)
+            try:
+                (self._task_dir(task_id) / ".guards" / f"{run_id}.sha256").unlink(missing_ok=True)
+            except OSError:
+                pass
             return task
 
     def list_attempts(self, task_id: str) -> list[AttemptRecord]:

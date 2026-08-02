@@ -818,14 +818,18 @@ class Pico(RuntimeSecretsMixin, RuntimeCheckpointsMixin):
     def ask(self, user_message):
         return self.engine.ask(user_message)
 
-    def ask_run(self, user_message, on_run_started=None):
+    def ask_run(self, user_message, on_run_started=None, run_id=None, task_id=None):
         """执行单个 Run，并可在执行前通过回调持久化其 Run 身份。
 
         ``ask()`` 的兼容返回值不变。需要 Durable Task 映射的调用方应使用
         本方法并在 ``on_run_started(run_id, legacy_engine_task_id)`` 内完成
         持久化；回调异常会阻止 Run 开始。
+
+        ``run_id`` / ``task_id`` 用于 checkpoint 恢复：注入时保持原 Run 身份。
         """
-        return self.engine.ask_run(user_message, on_run_started=on_run_started)
+        return self.engine.ask_run(
+            user_message, on_run_started=on_run_started, run_id=run_id, task_id=task_id
+        )
 
     def abort_current_turn(self):
         self.abort_requested = True

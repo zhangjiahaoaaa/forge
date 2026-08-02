@@ -14,7 +14,7 @@ def test_core_modules_stay_below_entropy_budget():
         "forge/core/context_manager.py": 420,
         "forge/core/context_usage.py": 120,
         "forge/core/compact.py": 180,
-        "forge/core/engine.py": 570,
+        "forge/core/engine.py": 580,
         "forge/core/model_errors.py": 120,
         "forge/core/permissions.py": 140,
         "forge/core/tool_policy.py": 110,

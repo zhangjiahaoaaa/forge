@@ -658,19 +658,27 @@ def _build_controller():
         args = parser.parse_args([])
         return build_agent(args)
 
+    def _build_resume_agent(session_id):
+        """按 session_id 恢复同一会话的 Forge agent（会话历史 = 恢复现场）。"""
+        parser = build_arg_parser()
+        args = parser.parse_args([])
+        args.resume = session_id
+        return build_agent(args)
+
     return LoopController(
         task_store=store,
         contract_store=cs,
         verification_service=vs,
         context_builder=TaskContextBuilder(),
         build_agent_fn=_build_agent,
+        build_resume_agent_fn=_build_resume_agent,
     )
 
 
 def _main_loop(loop_argv):
     """Dispatch for 'forge loop <subcommand> [args...]'."""
     if not loop_argv:
-        print("usage: forge loop advance|run <task_id>", file=sys.stderr)
+        print("usage: forge loop advance|run|recover <task_id> [--force]", file=sys.stderr)
         return 1
 
     cmd = loop_argv[0].lower()
@@ -684,6 +692,20 @@ def _main_loop(loop_argv):
 
     if cmd == "advance":
         result = controller.advance(task_id)
+        task = result.get("task")
+        print(f"action:   {result.get('action', '?')}")
+        print(f"reason:   {result.get('reason', '?')}")
+        if task:
+            print(f"status:   {getattr(task, 'status', '?')}")
+            print(f"phase:    {getattr(task, 'phase', '?')}")
+            print(f"cycle:    {getattr(task, 'cycle', 0)}")
+        return 0
+
+    if cmd == "recover":
+        # 进程崩溃后遗留 running 任务：检测 active run 并尝试 resume 同一 Run。
+        # --force：确认原进程已死后跳过 owner PID 存活检查。
+        force = "--force" in args[1:]
+        result = controller.recover(task_id, force=force)
         task = result.get("task")
         print(f"action:   {result.get('action', '?')}")
         print(f"reason:   {result.get('reason', '?')}")
@@ -1125,6 +1147,42 @@ def _main_contract(contract_argv):
     return 1
 
 
+def _main_benchmark(bench_argv):
+    """Dispatch for 'forge benchmark <name> [args...]'."""
+    if not bench_argv:
+        print("usage: forge benchmark loop [--artifact PATH] [--fixtures DIR] [--workspace DIR]",
+              file=sys.stderr)
+        return 1
+
+    name = bench_argv[0].lower()
+    if name != "loop":
+        print(f"error: unknown benchmark: {name}", file=sys.stderr)
+        return 1
+
+    parser = argparse.ArgumentParser(prog="forge benchmark loop")
+    parser.add_argument("--artifact", default=None, help="JSON artifact 输出路径")
+    parser.add_argument("--fixtures", default=None, help="fixture 根目录（默认 <cwd>/tests/fixtures）")
+    parser.add_argument("--workspace", default=None, help="benchmark 工作区目录（默认临时目录）")
+    bargs = parser.parse_args(bench_argv[1:])
+
+    try:
+        from .evaluation.loop_benchmark import run_loop_benchmark
+        report = run_loop_benchmark(
+            fixtures_root=bargs.fixtures,
+            workspace_root=bargs.workspace,
+            artifact_path=bargs.artifact,
+        )
+    except Exception as exc:
+        print(f"error: benchmark failed: {exc}", file=sys.stderr)
+        return 1
+
+    summary = {k: v for k, v in report.items() if k != "results"}
+    print(json.dumps(summary, indent=2, ensure_ascii=False))
+    if bargs.artifact:
+        print(f"artifact saved: {bargs.artifact}")
+    return 0
+
+
 def _resolve_tasks_root() -> Path:
     """返回当前工作区 Durable Task 文件根目录。"""
     store = _task_store_for_workspace(Path.cwd())
@@ -1151,7 +1209,8 @@ def interaction_mode(args):
 
 
 def main(argv=None):
-    # Detect "forge task ..." / "forge contract ..." / "forge loop ..." before argparse
+    # Detect "forge task ..." / "forge contract ..." / "forge loop ..." / "forge benchmark ..."
+    # before argparse
     if argv is None:
         argv = sys.argv[1:]
     first = argv[0].lower() if argv else ""
@@ -1161,6 +1220,8 @@ def main(argv=None):
         return _main_contract(argv[1:])
     if first == "loop":
         return _main_loop(argv[1:])
+    if first == "benchmark":
+        return _main_benchmark(argv[1:])
 
     args = build_arg_parser().parse_args(argv)
 

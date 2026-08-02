@@ -29,6 +29,7 @@ dev = [
 include = ["forge*"]
 
 [tool.pytest.ini_options]
+testpaths = ["tests"]
 norecursedirs = [
   ".git",
   ".venv",
@@ -36,4 +37,5 @@ norecursedirs = [
   "build",
   "dist",
   "tests/fixtures",
+  "tmp-pytest",
 ]

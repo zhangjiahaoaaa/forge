@@ -380,8 +380,15 @@ def _safe_segment(task_id: str) -> str:
 
 
 def _normalize_relative_path(path: str) -> str:
-    """将 Git 输出规范化为相对 POSIX 路径。"""
-    return str(path).strip().replace("\\", "/").lstrip("./")
+    """将 Git 输出规范化为相对 POSIX 路径。
+
+    只剥离前导 ``./``（git 相对输出不携带），保留前导点目录名，
+    例如 ``.forge/tasks/...`` 不能被归一化成 ``forge/...``。
+    """
+    text = str(path).strip().replace("\\", "/")
+    while text.startswith("./"):
+        text = text[2:]
+    return text
 
 
 def _path_glob_matches(path: str, pattern: str) -> bool:
@@ -605,12 +612,26 @@ class ChangeScopeVerifier:
         return self._get_changed_files()
 
     def is_contract_path_modified(self, task_id: str) -> bool:
-        """检查受保护的 .forge/tasks/<task_id>/contract.json 是否被工作区修改。"""
-        contract_path = PurePosixPath(".forge/tasks") / _safe_segment(task_id) / "contract.json"
-        return contract_path.as_posix() in self._get_changed_files()
+        """检查受保护的 .forge/tasks/<task_id>/contract.json 是否被工作区修改。
+
+        注意：``_get_changed_files()`` 已排除 ``.forge/`` runtime 目录，
+        因此该 git 变更检测通常不会命中；Contract 不可变的权威守卫是
+        ``_contract_is_trusted()``（内容哈希比对）。此处保留路径归一化
+        一致性，供 .forge 被显式纳入版本控制的仓库使用。
+        """
+        contract_path = _normalize_relative_path(
+            (PurePosixPath(".forge/tasks") / _safe_segment(task_id) / "contract.json").as_posix()
+        )
+        return contract_path in self._get_changed_files()
 
     def _get_changed_files(self) -> list[str]:
-        """汇总 unstaged、staged 与 untracked 文件，不因某一类非空而短路。"""
+        """汇总 unstaged、staged 与 untracked 文件，不因某一类非空而短路。
+
+        Runtime 状态目录（``.forge/`` / ``.pico/``）不属于业务变更：
+        - 排除它们后，ChangeScopeVerifier 不会把运行时状态误判为 scope 违规；
+        - Contract 完整性由 ``_contract_is_trusted()`` 的内容哈希守护，
+          git 变更检测只是辅助手段（.forge 在真实仓库中通常被 gitignore）。
+        """
         commands = (
             ["git", "diff", "--name-only", "--relative"],
             ["git", "diff", "--cached", "--name-only", "--relative"],
@@ -629,14 +650,17 @@ class ChangeScopeVerifier:
                     )
         except (subprocess.SubprocessError, FileNotFoundError):
             pass
-        return sorted(files)
+        return sorted(
+            f for f in files
+            if not f.startswith((".forge/", ".pico/"))
+        )
 
     @staticmethod
     def _matches_pattern(path: str, patterns: list[str]) -> bool:
         """按 POSIX 路径 glob 匹配，避免将模式作为任意子串处理。"""
         normalized_path = _normalize_relative_path(path)
         for pattern in patterns:
-            normalized_pattern = str(pattern).replace("\\", "/").lstrip("./")
+            normalized_pattern = _normalize_relative_path(pattern)
             if normalized_pattern and _path_glob_matches(normalized_path, normalized_pattern):
                 return True
         return False

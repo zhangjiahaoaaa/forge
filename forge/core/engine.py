@@ -37,15 +37,22 @@ class Engine:
                 final_answer = event["content"]
         return final_answer
 
-    def ask_run(self, user_message, on_run_started=None) -> RunResult:
+    def ask_run(self, user_message, on_run_started=None, run_id=None, task_id=None) -> RunResult:
         """运行单个 turn，并返回供外层持久化使用的结构化结果。
 
         ``on_run_started`` 在 Run 身份创建后、任何 Harness 工作开始前调用。
         Durable Task 调用方应在该回调中落盘 active Run；若回调失败，Run
         不会继续执行，从而避免出现无法恢复的未关联 artifact。
+
+        ``run_id`` / ``task_id`` 用于 checkpoint 恢复：传入时保持原 Run 身份
+        （不生成新 run_id）。会话历史的恢复由调用方负责——用同一 session_id
+        重建 agent 后，模型能看到已完成的历史，从而自然续接；本方法不会
+        重放或跳过历史中的工具动作。
         """
         result = RunResult()
-        for event in self.run_turn(user_message, on_run_started=on_run_started):
+        for event in self.run_turn(
+            user_message, on_run_started=on_run_started, run_id=run_id, task_id=task_id
+        ):
             if event["type"] == "turn_started":
                 result.run_id = event.get("run_id", "")
             if event["type"] in {"final", "stop"}:
@@ -93,13 +100,18 @@ class Engine:
                 "content": notification,
             }
 
-    def run_turn(self, user_message, on_run_started=None):
-        """执行一个 Run；可选回调在任何执行副作用前取得 Run 身份。"""
+    def run_turn(self, user_message, on_run_started=None, run_id=None, task_id=None):
+        """执行一个 Run；可选回调在任何执行副作用前取得 Run 身份。
+
+        ``run_id`` / ``task_id`` 用于 checkpoint 恢复：注入时保持原 Run 身份，
+        让中断后的同一次业务尝试在同一 run_id 下继续。会话历史恢复依赖
+        调用方用同一 session_id 重建 agent；本方法不重放历史工具动作。
+        """
         agent = self.runtime
         run_started_at = time.monotonic()
         task_state = TaskState.create(
-            run_id=agent.new_run_id(),
-            task_id=agent.new_task_id(),
+            run_id=run_id or agent.new_run_id(),
+            task_id=task_id or agent.new_task_id(),
             user_request=user_message,
         )
         task_state.bug_fix_ledger = bug_fix_ledger.create_ledger(user_message)

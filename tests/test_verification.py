@@ -334,6 +334,53 @@ def test_change_scope_rejects_allowed_path_violation(tmp_path):
     assert verdict.value == "allowed_outside_scope"
 
 
+def test_change_scope_ignores_runtime_state_dir(tmp_path):
+    """.forge / .pico 运行时状态不是业务变更：不参与 scope 判定。
+
+    回归 PR 4 独立复核误报：干净 workspace 重建 Task 后 .forge 是 untracked，
+    若被计入变更列表，scope 检查会把 contract.json 判为 allowed_outside_scope，
+    导致所有 completed 任务被误报 false_completion。
+    """
+    _init_git(tmp_path)
+    _make_file(tmp_path / "calculator.py", "def add(a, b):\n    return a - b\n")
+    _git_add(tmp_path, "calculator.py")
+    _git_commit(tmp_path, "baseline")
+
+    # 模拟 benchmark workspace：git init 后新建 .forge 运行时文件（untracked）
+    runtime = tmp_path / ".forge" / "tasks" / "task_x"
+    runtime.mkdir(parents=True)
+    _make_file(runtime / "contract.json", '{"goal": "frozen"}')
+    _make_file(runtime / "task.json", '{"phase": "running"}')
+
+    cv = ChangeScopeVerifier(tmp_path)
+    changed = cv.diff_summary()
+    assert all(".forge" not in f and ".pico" not in f for f in changed), changed
+    assert "calculator.py" not in changed  # 尚未修改
+
+    # agent 只改 calculator.py → scope ALLOWED（不被 .forge 干扰）
+    _make_file(tmp_path / "calculator.py", "def add(a, b):\n    return a + b\n")
+    contract = AcceptanceContract(
+        goal="test",
+        change_policy=ChangePolicy(allowed_paths=["calculator.py"]),
+    )
+    assert cv.check(contract).value == "allowed"
+
+
+def test_contract_path_modified_uses_consistent_normalization(tmp_path):
+    """is_contract_path_modified 与 _get_changed_files 使用同一路径归一化。"""
+    _init_git(tmp_path)
+    _make_file(tmp_path / "main.py", "x\n")
+    _git_add(tmp_path, "main.py")
+    _git_commit(tmp_path, "baseline")
+
+    cv = ChangeScopeVerifier(tmp_path)
+    # 运行时目录已被排除 → 即使存在 .forge contract 文件也不视为修改
+    contract_path = tmp_path / ".forge" / "tasks" / "task_y" / "contract.json"
+    contract_path.parent.mkdir(parents=True)
+    _make_file(contract_path, '{"goal": "x"}')
+    assert cv.is_contract_path_modified("task_y") is False
+
+
 # ---------------------------------------------------------------------------
 # EvidenceRecorder
 # ---------------------------------------------------------------------------
