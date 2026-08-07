@@ -2,16 +2,13 @@
 
 # forge
 
-**轻量、本地、有记忆的终端 coding agent**
+**面向真实仓库的 Local Coding Agent 与 Loop Engineer**
 
-forge 跑在本地仓库里，接上一个模型 provider，就能读代码、跑命令、改文件、
-保留运行证据，并把有价值的上下文沉淀成本地记忆。
+forge 不只执行一次 prompt → tool → prompt 的 agent run；它把复杂编码目标放进一个**可验证、可恢复、可审计的外层工程循环**：建立任务与验收合同、复现问题、执行修复、独立验证、检测停滞，并在需要时转交人工。
+
+接上一个模型 provider 后，forge 就能在本地仓库中读代码、跑命令、改文件、保留运行证据，并把有价值的上下文沉淀成本地记忆。
 
 </div>
-
-<p align="center">
-  <img src="assets/screenshots/forge-main.png" alt="Forge 主界面" width="960">
-</p>
 
 <p align="center">
   <img src="assets/screenshots/forge-tui-intro.png" alt="forge TUI 启动界面" width="960">
@@ -21,7 +18,9 @@ forge 跑在本地仓库里，接上一个模型 provider，就能读代码、�
 
 ## forge 是什么
 
-forge 是一个本地终端里的 coding agent，运行在你的仓库上下文里。一次 agent 运行会被拆成几个可观察的部分：
+forge 是一个在仓库上下文中运行的本地 coding agent，也是一个面向长期编码目标的 **Loop Engineer**。它把模型能力放进受约束的工程闭环：模型负责探索与修改，合同和 verifier 负责判断，持久化 task state 负责续接，明确的预算、停滞信号与人工升级负责控制边界。
+
+一次 agent run 与 durable task loop 会被拆成几个可观察的部分：
 
 - **provider profile**：决定调用哪个模型、哪个 endpoint、用什么协议。
 - **context**：把系统提示、仓库信息、skills、记忆和最近对话装进 prompt。
@@ -29,8 +28,9 @@ forge 是一个本地终端里的 coding agent，运行在你的仓库上下文�
 - **approval / sandbox**：写操作和 shell 命令可以被审批或沙箱限制。
 - **session / run evidence**：对话、事件流、trace、report 都写到本地 `.forge/`。
 - **memory / dream**：把 daily log 整理成长期 topic，下次 session 可以继续用。
+- **Loop Engineer**：将目标、冻结的验收合同、基线复现、Agent 尝试、独立验证与人工升级组织成可续接的闭环。
 
-forge 关注本地 coding agent 的工程边界：配置清楚、任务能续接、结果能复盘。
+forge 关注本地 coding agent 的工程边界：配置清楚、任务可验证可续接、结果可复盘。
 
 ## 界面
 
@@ -228,9 +228,9 @@ forge --no-auto-dream              # 关闭后台 memory 整合
 | `/clear` | 开一个新的空 session。 |
 | `/exit` | 退出 forge。 |
 
-### Durable task loop
+### Loop Engineer：Durable task loop
 
-`forge goal "<目标>"` 和 `/goal <目标>` 会创建一个可恢复的任务，保存默认验收合同后执行 Loop。
+`forge goal "<目标>"` 和 `/goal <目标>` 是 Forge 的 Loop Engineer 入口：它们会创建一个可恢复的任务，冻结默认验收合同，再按“基线复现 → Agent 修复 → 独立验证 → 继续、停止或人工升级”的闭环执行。
 如果仓库中发现 pytest 测试，默认以 `python -m pytest -q` 作为复现和验收，并禁止修改已发现的测试文件；未发现测试时，才回退到 Python 语法检查。
 
 默认预算为最多 4 个 cycle、80 个工具步骤和 30 分钟。任务可能完成、失败、阻塞或转为等待人工；默认合同未能复现自然语言目标时，Forge 会要求补充目标级测试或手写合同，而不会把任务误报为已解决。运行状态和验收记录保存在 `.forge/tasks/<task_id>/`，可用 `forge task show <task_id>` 查看。
