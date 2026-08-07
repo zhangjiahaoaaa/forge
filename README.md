@@ -10,6 +10,10 @@ forge 跑在本地仓库里，接上一个模型 provider，就能读代码、�
 </div>
 
 <p align="center">
+  <img src="assets/screenshots/forge-main.png" alt="Forge 主界面" width="960">
+</p>
+
+<p align="center">
   <img src="assets/screenshots/forge-tui-intro.png" alt="forge TUI 启动界面" width="960">
 </p>
 

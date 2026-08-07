@@ -36,6 +36,7 @@ tmp/
 artifacts/
 readme_intro_locked/
 tasks/
+.claude/
 
 # Local secrets and provider configuration
 .env
