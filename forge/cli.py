@@ -25,7 +25,7 @@ from .config import (
 )
 from .features import skills as skillslib
 from .features.skills_runtime import invoke_skill
-from .features.loop import LoopController, TaskContextBuilder
+from .features.loop import LoopController, LoopPolicy, TaskContextBuilder
 from .features.task_record import TaskStore, TaskStatus
 from .features.verification import (
     AcceptanceContract,
@@ -78,6 +78,10 @@ HELP_DETAILS = (
         """\
     Skill workflows:
     /skill <name> [args] Run a user-invocable skill.
+
+    Loop workflows:
+    /goal <目标>      一句话启动 Loop 任务：自动建任务、生成默认合同（有测试
+                     用测试当验收、没有测试用语法检查）、绑定后跑完整循环。
     """
     ).strip()
 )
@@ -412,6 +416,36 @@ def handle_repl_command(agent, user_input):
         return True, False, "Saved to daily log."
     if user_input == "/dream":
         return True, False, agent.run_dream()
+    if user_input == "/goal" or user_input.startswith("/goal "):
+        # 像 Codex /goal 一样：一句话目标直接在 REPL 里启动 Loop
+        _, _, raw_goal = user_input.partition(" ")
+        goal = raw_goal.strip()
+        if not goal:
+            return True, False, "Usage: /goal <目标>   例如: /goal 修复 calculator.add 的符号错误"
+        cwd = Path(getattr(agent, "root", Path.cwd())).resolve()
+        try:
+            store, task, contract, controller = _start_goal_task(
+                goal, cwd, agent=agent
+            )
+            lines = [
+                f"task_id:   {task.task_id}",
+                f"goal:      {goal}",
+                f"verify:    {contract.verify_commands[0].command if contract.verify_commands else '(none)'}",
+                f"forbidden: {contract.change_policy.forbidden_paths or '(none)'}",
+                "--- Loop 开始 ---",
+            ]
+            result = controller.advance_full(task.task_id)
+            t = result.get("task") or store.load_task(task.task_id)
+            lines.append(f"action:    {result.get('action', '?')}")
+            lines.append(f"reason:    {result.get('reason', '?')}")
+            lines.append(f"status:    {getattr(t, 'status', '?')}")
+            lines.append(f"cycle:     {getattr(t, 'cycle', 0)}")
+            lines.append(f"summary:   {getattr(t, 'last_run_summary', '')[:200]}")
+            return True, False, "\n".join(lines)
+        except Exception as exc:
+            task_id = getattr(locals().get("task"), "task_id", "")
+            suffix = f"; inspect with: forge task show {task_id}" if task_id else ""
+            return True, False, f"error: goal 启动失败: {exc}{suffix}"
     if user_input == "/skills":
         return True, False, skillslib.render_skills_list(agent.skills)
     if user_input == "/plan" or user_input.startswith("/plan "):
@@ -640,30 +674,93 @@ def _task_store_for_workspace(cwd: Path) -> TaskStore:
     return TaskStore(forge_dir)
 
 
-def _build_controller():
-    """从当前工作区构建一个 LoopController。"""
-    cwd = Path.cwd().resolve()
+def _loop_model_client(source_agent):
+    """为 Loop 的新 Run 创建与交互 Agent 配置一致的模型 client。"""
+    factory = getattr(source_agent, "model_client_factory", None)
+    model_client = factory() if callable(factory) else source_agent.model_client
+    current_model = getattr(source_agent.model_client, "model", None)
+    if current_model and hasattr(model_client, "model"):
+        model_client.model = current_model
+    return model_client
+
+
+def _loop_agent_kwargs(source_agent) -> dict:
+    """提取 Loop Run 必须继承的运行时配置，避免退回 CLI 默认值。"""
+    return {
+        "workspace": source_agent.workspace,
+        "session_store": source_agent.session_store,
+        "approval_policy": source_agent.approval_policy,
+        "max_steps": source_agent.max_steps,
+        "max_new_tokens": source_agent.max_new_tokens,
+        "depth": source_agent.depth,
+        "max_depth": source_agent.max_depth,
+        "read_only": source_agent.read_only,
+        "shell_env_allowlist": source_agent.shell_env_allowlist,
+        "secret_env_names": source_agent.secret_env_names,
+        "feature_flags": source_agent.feature_flags,
+        "write_scope": source_agent.write_scope,
+        "memory_dir": source_agent.memory_dir,
+        "auto_dream": source_agent.auto_dream,
+        "dream_interval_hours": source_agent.dream_interval_hours,
+        "dream_min_sessions": source_agent.dream_min_sessions,
+        "model_client_factory": source_agent.model_client_factory,
+        "sandbox_config": source_agent.sandbox_config,
+        "ask_user_callback": source_agent.ask_user_callback,
+    }
+
+
+def _inherit_interaction_callbacks(loop_agent, source_agent) -> None:
+    """复用当前交互层的审批和问答回调，TUI 中不得回退到 stdin。"""
+    loop_agent.approve = source_agent.approve
+    loop_agent.ask_user_callback = source_agent.ask_user_callback
+
+
+def _build_controller(cwd: Path | None = None, source_agent=None):
+    """为指定工作区构建 LoopController。"""
+    cwd = Path(cwd or Path.cwd()).resolve()
     from .paths import WORKSPACE_STATE_DIRNAME
+
     forge_dir = cwd / WORKSPACE_STATE_DIRNAME
     forge_dir.mkdir(parents=True, exist_ok=True)
     tasks_root = forge_dir / "tasks"
     store = TaskStore(forge_dir)
     from .features.verification import ContractStore, TaskVerificationService
+
     cs = ContractStore(tasks_root)
     vs = TaskVerificationService(store, cs, cwd, tasks_root)
 
-    def _build_agent():
-        """Build a Forge agent from CLI defaults (no provider override needed)."""
-        parser = build_arg_parser()
-        args = parser.parse_args([])
-        return build_agent(args)
+    if source_agent is not None:
+        def _build_agent():
+            loop_agent = Pico(
+                model_client=_loop_model_client(source_agent),
+                **_loop_agent_kwargs(source_agent),
+            )
+            _inherit_interaction_callbacks(loop_agent, source_agent)
+            return loop_agent
 
-    def _build_resume_agent(session_id):
-        """按 session_id 恢复同一会话的 Forge agent（会话历史 = 恢复现场）。"""
-        parser = build_arg_parser()
-        args = parser.parse_args([])
-        args.resume = session_id
-        return build_agent(args)
+        def _build_resume_agent(session_id):
+            loop_agent = Pico.from_session(
+                model_client=_loop_model_client(source_agent),
+                session_id=session_id,
+                **_loop_agent_kwargs(source_agent),
+            )
+            _inherit_interaction_callbacks(loop_agent, source_agent)
+            return loop_agent
+    else:
+        def _build_agent():
+            """为独立 loop CLI 构建与目标工作区一致的 Agent。"""
+            parser = build_arg_parser()
+            args = parser.parse_args([])
+            args.cwd = str(cwd)
+            return build_agent(args)
+
+        def _build_resume_agent(session_id):
+            """按 session_id 恢复同一会话的 Forge agent（会话历史 = 恢复现场）。"""
+            parser = build_arg_parser()
+            args = parser.parse_args([])
+            args.cwd = str(cwd)
+            args.resume = session_id
+            return build_agent(args)
 
     return LoopController(
         task_store=store,
@@ -729,6 +826,57 @@ def _main_loop(loop_argv):
 
     print(f"error: unknown loop command: {cmd}", file=sys.stderr)
     return 1
+
+
+def _start_goal_task(goal: str, cwd: Path, agent=None):
+    """创建任务、自动绑定默认合同，并返回对应工作区的 LoopController。"""
+    from .features.verification import ContractStore, discover_default_contract
+
+    cwd = Path(cwd).resolve()
+    store = _task_store_for_workspace(cwd)
+    task = store.create_task(goal)
+    contract = discover_default_contract(goal, cwd)
+    tasks_root = store.root / "tasks"
+    tasks_root.mkdir(parents=True, exist_ok=True)
+    cs = ContractStore(tasks_root)
+    cs.save_contract(task.task_id, contract, allow_replace=True)
+    task.contract_hash = contract.content_hash
+    task.policy = LoopPolicy(
+        max_cycles=4, max_total_tool_steps=80, max_wall_time_seconds=1800
+    ).to_dict()
+    store.save_task(task)
+    return store, task, contract, _build_controller(cwd, source_agent=agent)
+
+
+def _main_goal(goal_argv):
+    """'forge goal "<目标>"' —— 一句话启动 Loop 任务。
+
+    自动完成：创建任务 → 探测并生成默认合同（有测试用测试当验收，
+    没有测试用语法检查兜底）→ 绑定合同 → 跑完整 Loop。
+    """
+    if not goal_argv:
+        print('usage: forge goal "<目标>"  例如: forge goal "修复 calculator.add 的符号错误"',
+              file=sys.stderr)
+        return 1
+
+    goal = " ".join(goal_argv).strip()
+    cwd = Path.cwd().resolve()
+    store, task, contract, controller = _start_goal_task(goal, cwd)
+
+    print(f"task_id:   {task.task_id}")
+    print(f"goal:      {goal}")
+    print(f"verify:    {contract.verify_commands[0].command if contract.verify_commands else '(none)'}")
+    print(f"forbidden: {contract.change_policy.forbidden_paths or '(none)'}")
+    print("--- 开始 Loop ---")
+
+    result = controller.advance_full(task.task_id)
+    task = result.get("task") or store.load_task(task.task_id)
+    print(f"action:    {result.get('action', '?')}")
+    print(f"reason:    {result.get('reason', '?')}")
+    print(f"status:    {getattr(task, 'status', '?')}")
+    print(f"cycle:     {getattr(task, 'cycle', 0)}")
+    print(f"summary:   {getattr(task, 'last_run_summary', '')[:200]}")
+    return 0 if result.get("action") in ("completed", "waiting_human") else 1
 
 
 def _main_task(task_argv):
@@ -1225,7 +1373,7 @@ def interaction_mode(args):
 
 def main(argv=None):
     # Detect "forge task ..." / "forge contract ..." / "forge loop ..." / "forge benchmark ..."
-    # before argparse
+    # / "forge goal ..." before argparse
     if argv is None:
         argv = sys.argv[1:]
     first = argv[0].lower() if argv else ""
@@ -1237,6 +1385,8 @@ def main(argv=None):
         return _main_loop(argv[1:])
     if first == "benchmark":
         return _main_benchmark(argv[1:])
+    if first == "goal":
+        return _main_goal(argv[1:])
 
     args = build_arg_parser().parse_args(argv)
 

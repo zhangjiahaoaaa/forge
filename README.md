@@ -47,13 +47,13 @@ TUI 直接连接同一个 runtime。输入框、工具结果、状态栏、slash
 一键安装：
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/martin-los/forge/main/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/zhangjiahaoaaa/forge/main/install.sh | bash
 ```
 
 源码安装：
 
 ```bash
-git clone https://github.com/martin-los/forge.git
+git clone https://github.com/zhangjiahaoaaa/forge.git
 cd forge
 pip install -e .
 ```
@@ -169,6 +169,7 @@ forge --config /path/to/custom.toml --cwd /path/to/repo
 forge                              # 默认 Textual TUI
 forge --repl                       # 普通终端 REPL
 forge "找出测试失败的根因"          # one-shot 任务
+forge goal "修复登录接口空指针"      # 创建并执行可持久化任务循环
 forge --resume latest              # 续接最近 session
 forge --cwd /path/to/repo          # 指定工作目录
 ```
@@ -191,6 +192,7 @@ forge --no-auto-dream              # 关闭后台 memory 整合
 > /help
 > /skills
 > 找出测试失败的根因
+> /goal 修复登录接口空指针
 > /plan 重构 provider 配置加载逻辑
 > /review
 > /test tests/test_config.py
@@ -213,6 +215,7 @@ forge --no-auto-dream              # 关闭后台 memory 整合
 | `/working-memory` | 查看当前 session 工作记忆。 |
 | `/remember <text>` | 保存一条 durable note 到 daily log。 |
 | `/dream` | 把 daily log 整合成 durable memory topics。 |
+| `/goal <目标>` | 创建可持久化任务、生成默认验收合同并运行自动循环。 |
 | `/plan <topic>` | 进入 plan mode。 |
 | `/plan-exit` | 退出 plan mode。 |
 | `/agents` | 查看子 agent 状态。 |
@@ -220,6 +223,13 @@ forge --no-auto-dream              # 关闭后台 memory 整合
 | `/compact` | 压缩较早的对话历史。 |
 | `/clear` | 开一个新的空 session。 |
 | `/exit` | 退出 forge。 |
+
+### Durable task loop
+
+`forge goal "<目标>"` 和 `/goal <目标>` 会创建一个可恢复的任务，保存默认验收合同后执行 Loop。
+如果仓库中发现 pytest 测试，默认以 `python -m pytest -q` 作为复现和验收，并禁止修改已发现的测试文件；未发现测试时，才回退到 Python 语法检查。
+
+默认预算为最多 4 个 cycle、80 个工具步骤和 30 分钟。任务可能完成、失败、阻塞或转为等待人工；默认合同未能复现自然语言目标时，Forge 会要求补充目标级测试或手写合同，而不会把任务误报为已解决。运行状态和验收记录保存在 `.forge/tasks/<task_id>/`，可用 `forge task show <task_id>` 查看。
 
 ## forge 能做什么
 
@@ -243,6 +253,7 @@ forge --no-auto-dream              # 关闭后台 memory 整合
 | 会话历史 | `.forge/sessions/<id>.json` |
 | 事件流 | `.forge/sessions/<id>.events.jsonl` |
 | 运行证据 | `.forge/runs/<run_id>/` |
+| Durable tasks 与验收记录 | `.forge/tasks/<task_id>/` |
 | 记忆索引 | `.forge/memory/MEMORY.md` |
 | Daily logs | `.forge/memory/logs/YYYY/MM/YYYY-MM-DD.md` |
 | Durable topics | `.forge/memory/topics/*.md` |

@@ -550,7 +550,23 @@ class LoopController:
             return {"action": "baseline_ready", "reason": "reproduced", "task": task}
 
         if verdict == ReproductionVerdict.NOT_REPRODUCED:
-            # 执行最终验证，显式携带冻结的 Contract 和基线快照。
+            contract = self.contract_store.load_contract(task.task_id)
+            if contract is not None and getattr(contract, "default_contract", False):
+                # 自动合同无法证明用户自然语言目标已经解决；要求补充可复现验收。
+                task.status = "waiting_human"
+                task.phase = ""
+                task.completion_reason = "default_contract_not_reproduced"
+                task.last_run_summary = (
+                    "默认合同未复现目标失败；请补充目标测试或使用手写 Contract 后重新启动。"
+                )
+                self.task_store.save_task(task)
+                return {
+                    "action": "waiting_human",
+                    "reason": task.completion_reason,
+                    "task": task,
+                }
+
+            # 显式合同未复现时，仍执行最终验证以识别已解决任务。
             v_verdict, v_info = self.verification_service.run_verification(
                 task.task_id,
                 expected_contract_hash=contract_hash,

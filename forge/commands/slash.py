@@ -21,6 +21,11 @@ SLASH_COMMANDS: tuple[SlashCommand, ...] = (
     SlashCommand("context", "/context", "Show prompt context usage."),
     SlashCommand("dream", "/dream", "Consolidate durable memory."),
     SlashCommand("history", "/history", "List saved sessions."),
+    SlashCommand(
+        "goal",
+        "/goal <目标>",
+        "Start a contract-backed durable task Loop.",
+    ),
     SlashCommand("memory", "/memory", "Show durable memory index."),
     SlashCommand("mode", "/mode", "Show runtime mode."),
     SlashCommand("model", "/model [name]", "Show or switch the current model."),

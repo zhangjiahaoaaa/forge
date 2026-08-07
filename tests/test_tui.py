@@ -181,6 +181,29 @@ async def test_tui_slash_suggestions_complete_partial_command(tmp_path):
         assert suggestions.visible is False
 
 
+@pytest.mark.asyncio
+async def test_tui_slash_suggestions_complete_goal_command(tmp_path):
+    from forge.tui.app import ForgeTuiApp
+    from forge.tui.widgets import InputBar, SlashSuggestions
+
+    app = ForgeTuiApp(build_agent(tmp_path, []))
+
+    async with app.run_test() as pilot:
+        bar = app.query_one(InputBar)
+        bar.input.value = "/go"
+        bar.update_slash_suggestions()
+
+        suggestions = app.query_one(SlashSuggestions)
+        assert suggestions.visible is True
+        assert "/goal" in rendered_text(suggestions)
+
+        await pilot.press("tab")
+        await pilot.pause(delay=0.1)
+
+        assert bar.input.value == "/goal "
+        assert suggestions.visible is False
+
+
 def test_agents_slash_command_shows_worker_status(tmp_path):
     from forge.cli import handle_repl_command
 
@@ -225,6 +248,41 @@ async def test_tui_help_command_uses_existing_repl_commands(tmp_path):
         text = "\n".join(assistant_contents(app))
         assert "Commands:" in text
         assert "/memory" in text
+
+
+@pytest.mark.asyncio
+async def test_tui_runs_goal_command_in_background(tmp_path, monkeypatch):
+    from threading import Event
+
+    from forge.tui.app import ForgeTuiApp
+    from forge.tui.widgets import InputBar
+
+    started = Event()
+    release = Event()
+
+    def fake_command(agent, text):
+        assert text == "/goal 修复登录"
+        started.set()
+        assert release.wait(timeout=2)
+        return True, False, "Loop completed."
+
+    monkeypatch.setattr("forge.tui.app.handle_repl_command", fake_command)
+    app = ForgeTuiApp(build_agent(tmp_path, []))
+
+    async with app.run_test() as pilot:
+        bar = app.query_one(InputBar)
+        bar.input.value = "/goal 修复登录"
+        await pilot.press("enter")
+        await pilot.pause(delay=0.1)
+
+        assert started.is_set()
+        assert bar.input.disabled is True
+
+        release.set()
+        await pilot.pause(delay=0.2)
+
+        assert "Loop completed." in "\n".join(assistant_contents(app))
+        assert bar.input.disabled is False
 
 
 @pytest.mark.asyncio

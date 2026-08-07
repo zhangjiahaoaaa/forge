@@ -106,6 +106,8 @@ class AcceptanceContract:
     reproduce_timeout: int = 60
     verify_commands: list[VerifyCommand] = field(default_factory=list)
     change_policy: ChangePolicy = field(default_factory=ChangePolicy)
+    default_contract: bool = False
+    """是否由 `forge goal` 自动生成；未复现时不得据此判定任务已解决。"""
 
     @property
     def canonical_hash(self) -> str:
@@ -121,7 +123,7 @@ class AcceptanceContract:
         return self.canonical_hash
 
     def to_dict(self) -> dict:
-        return {
+        data = {
             "schema_version": self.schema_version,
             "goal": self.goal,
             "reproduce": {
@@ -145,6 +147,10 @@ class AcceptanceContract:
                 "forbidden_paths": list(self.change_policy.forbidden_paths),
             },
         }
+        # 不向旧的显式 Contract 写入 false，保持已有冻结 hash 可继续校验。
+        if self.default_contract:
+            data["default_contract"] = True
+        return data
 
     @classmethod
     def from_dict(cls, data: dict) -> AcceptanceContract:
@@ -191,6 +197,7 @@ class AcceptanceContract:
             reproduce_timeout=int(reproduce_data.get("timeout_seconds", 60)),
             verify_commands=verify_commands,
             change_policy=change_policy,
+            default_contract=bool(data.get("default_contract", False)),
         )
 
 
@@ -289,6 +296,67 @@ def _extract_after(lines: list[str], marker: str) -> str:
         if found:
             parts.append(line)
     return "\n".join(parts)
+
+
+# ---------------------------------------------------------------------------
+# 默认合同自动发现（forge goal）
+# ---------------------------------------------------------------------------
+
+def _find_test_files(workspace_root: Path) -> list[str]:
+    """探测 pytest 测试文件（相对 POSIX 路径），排除运行时与依赖目录。"""
+    ignored_parts = {".git", ".forge", ".pico", ".venv", "venv", "node_modules",
+                     "__pycache__", ".pytest_cache", ".ruff_cache"}
+    tests: list[str] = []
+    root = Path(workspace_root).resolve()
+    for pattern in ("test_*.py", "*_test.py"):
+        for path in root.rglob(pattern):
+            try:
+                rel = path.relative_to(root)
+            except ValueError:
+                continue
+            if any(part in ignored_parts for part in rel.parts):
+                continue
+            tests.append(rel.as_posix())
+    return sorted(set(tests))
+
+
+def discover_default_contract(goal: str, workspace_root: Path) -> AcceptanceContract:
+    """从目标自动生成一个可执行的默认合同（forge goal 用）。
+
+    策略（规则化、确定性）：
+    - 项目里有 pytest 测试 → 验收 = 跑全部测试通过；禁止修改测试文件
+      （防模型改测试作弊）；复现 = 同一条命令，预期当前失败
+      （若当前已通过，Loop 转人工，要求补充目标级验收）；
+    - 没有测试 → 退化为"守门员合同"：验收 = 全部 .py 可编译（语法正确），
+      允许改任何业务文件。
+
+    这是"默认合同"，比手写合同粗糙；它的价值是让一句话目标可以直接开跑，
+    验收标准依然客观可执行、模型依然无法自判完成。
+    """
+    root = Path(workspace_root).resolve()
+    test_files = _find_test_files(root)
+
+    if test_files:
+        verify_command = "python -m pytest -q"
+        change_policy = ChangePolicy(
+            allowed_paths=["*"],
+            forbidden_paths=list(test_files),
+        )
+    else:
+        # 没有测试：至少保证语法正确（守门员式弱验收）
+        excluded = r"(\.venv|\.forge|\.pico|\.git|node_modules|__pycache__)"
+        verify_command = f"python -m compileall -q -f . -x \"{excluded}\""
+        change_policy = ChangePolicy(allowed_paths=["*"], forbidden_paths=[])
+
+    return AcceptanceContract(
+        goal=goal,
+        default_contract=True,
+        reproduce_command=verify_command,
+        reproduce_timeout=60,
+        reproduce=ReproduceExpectation(outcome="target_failure", exit_code=1),
+        verify_commands=[VerifyCommand(command=verify_command, timeout_seconds=120)],
+        change_policy=change_policy,
+    )
 
 
 # ---------------------------------------------------------------------------

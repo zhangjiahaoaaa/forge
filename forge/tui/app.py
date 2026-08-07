@@ -100,7 +100,10 @@ class ForgeTuiApp(App):
         if text.startswith("/"):
             self.query_one(ChatLog).add_message("user", text)
             bar.hide_slash_suggestions()
-            self._handle_command(text)
+            if text == "/goal" or text.startswith("/goal "):
+                self._run_long_command(text)
+            else:
+                self._handle_command(text)
             return
         self.query_one(ChatLog).add_message("user", text)
         self._run_agent(text)
@@ -171,6 +174,37 @@ class ForgeTuiApp(App):
             0.15, self.query_one(ThinkingIndicator).advance
         )
         asyncio.create_task(self._agent_task(text))
+
+    def _run_long_command(self, text: str) -> None:
+        """在后台运行可能包含多个 Agent Run 的命令，避免阻塞 TUI 事件循环。"""
+        self.query_one(InputBar).set_busy(True)
+        indicator = self.query_one(ThinkingIndicator)
+        indicator.show()
+        indicator.set_detail("running durable task Loop")
+        self._thinking_timer = self.set_interval(0.15, indicator.advance)
+        asyncio.create_task(self._long_command_task(text))
+
+    async def _long_command_task(self, text: str) -> None:
+        loop = asyncio.get_running_loop()
+        try:
+            handled, should_exit, output = await loop.run_in_executor(
+                None, partial(handle_repl_command, self.agent, text)
+            )
+            if should_exit:
+                self.exit()
+            elif handled:
+                self.query_one(ChatLog).add_message("assistant", output)
+            else:
+                self.query_one(ChatLog).add_message(
+                    "assistant", f"Unknown command. Use /help.\n\n{HELP_DETAILS}"
+                )
+        except Exception as exc:
+            self.query_one(ChatLog).add_message("assistant", f"[Error] {exc}")
+        finally:
+            self._stop_thinking()
+            self.query_one(InputBar).set_busy(False)
+            self.query_one(InputBar).focus_input()
+            self.query_one(StatusBar).update_agent(self.agent)
 
     def _drain_idle_worker_notifications(self) -> None:
         if self.query_one(InputBar).input.disabled:
