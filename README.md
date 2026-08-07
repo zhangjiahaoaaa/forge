@@ -10,10 +10,6 @@ forge 不只执行一次 prompt → tool → prompt 的 agent run；它把复杂
 
 </div>
 
-<p align="center">
-  <img src="assets/screenshots/forge-main.png" alt="Forge 主界面" width="960">
-</p>
-
 ---
 
 ## forge 是什么
@@ -31,18 +27,6 @@ forge 是一个在仓库上下文中运行的本地 coding agent，也是一个�
 - **Loop Engineer**：将目标、冻结的验收合同、基线复现、Agent 尝试、独立验证与人工升级组织成可续接的闭环。
 
 forge 关注本地 coding agent 的工程边界：配置清楚、任务可验证可续接、结果可复盘。
-
-## 界面
-
-TUI 直接连接同一个 runtime。输入框、工具结果、状态栏、slash command 和补全都来自当前 session。
-
-| 工具和子 agent | Skills、help 和命令补全 |
-| --- | --- |
-| ![forge TUI 工具表](assets/screenshots/forge-tui-tools.png) | ![forge TUI skills 和 help](assets/screenshots/forge-tui-skills-help.png) |
-
-| Memory 和 durable topics | Slash command 工作区 |
-| --- | --- |
-| ![forge TUI memory 和 skills](assets/screenshots/forge-tui-memory-skills.png) | ![forge TUI slash command 补全](assets/screenshots/forge-tui-latest.png) |
 
 ## 安装
 
