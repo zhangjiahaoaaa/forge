@@ -10,6 +10,10 @@ forge 不只执行一次 prompt → tool → prompt 的 agent run；它把复杂
 
 </div>
 
+<p align="center">
+  <img src="assets/screenshots/forge-main.png" alt="Forge 主界面" width="960">
+</p>
+
 ---
 
 ## forge 是什么
